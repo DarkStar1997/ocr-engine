@@ -27,7 +27,7 @@ app.add_middleware(
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         # add prod origins/domains here as needed
-        # "https://your-frontend.example.com",
+        "https://ocr.finotoai.com",
     ],
     allow_credentials=False,             # no cookies
     allow_methods=["POST", "GET", "OPTIONS"],
