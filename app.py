@@ -339,15 +339,54 @@ def compress_pdf_bytes(blob: bytes) -> bytes:
 # =========================
 # Renderers for file types
 # =========================
-def extract_from_pdf(blob: bytes, filename: str, translate_always: bool, zoom: float = 2.5) -> Dict:
+def extract_from_pdf(
+    blob: bytes,
+    filename: str,
+    translate_always: bool,
+    zoom: float = 2.5  # unused now; kept for signature compatibility
+) -> Dict:
+    """
+    Low-memory path: render each page to a capped-size JPEG and send
+    those images to the model in a single request.
+    - Caps longer side to ~1600 px
+    - JPEG quality ~55 (great OCR tradeoff)
+    - Frees per-page buffers immediately
+    """
+    max_side_px = 1600
+    jpeg_quality = 55
+
     page_urls: List[Tuple[int, str]] = []
     with fitz.open(stream=blob, filetype="pdf") as doc:
-        mat = fitz.Matrix(zoom, zoom)
         for i, page in enumerate(doc, start=1):
-            pix = page.get_pixmap(matrix=mat, alpha=False)
+            w_pt = float(page.rect.width)
+            h_pt = float(page.rect.height)
+
+            # Compute a safe scale so the longer side ~= max_side_px
+            cap_scale = max_side_px / max(w_pt, h_pt) if max(w_pt, h_pt) > 0 else 1.0
+            scale = max(1.0, min(2.0, cap_scale))  # keep it reasonable
+
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+
+            # Convert to PIL and hard-cap size; then JPEG-encode
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            page_urls.append((i, img_to_data_url(img, fmt="PNG")))
-    return ocr_document_structured(filename, page_urls, selectable_text=None, translate_always=translate_always)
+            img.thumbnail((max_side_px, max_side_px))
+
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True, progressive=True)
+            b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+            data_url = f"data:image/jpeg;base64,{b64}"
+            page_urls.append((i, data_url))
+
+            # Free memory ASAP
+            img.close()
+            del pix, buf
+
+    return ocr_document_structured(
+        filename,
+        page_urls,
+        selectable_text=None,
+        translate_always=translate_always,
+    )
 
 def extract_from_image(filename: str, blob: bytes, translate_always: bool) -> Dict:
     page_urls = [(1, file_to_data_url(filename, blob))]
@@ -416,13 +455,6 @@ def detect_type(filename: str, blob: bytes) -> str:
 def parse_file(filename: str, blob: bytes, lang: str) -> Dict:
     translate_always = (lang or "en").lower() == "hi"
     kind = detect_type(filename, blob)
-
-    # Always compress PDFs before processing (default behaviour)
-    if kind == "pdf":
-        try:
-            blob = compress_pdf_bytes(blob)
-        except Exception:
-            pass
 
     if kind == "pdf":
         return extract_from_pdf(blob, filename, translate_always)
