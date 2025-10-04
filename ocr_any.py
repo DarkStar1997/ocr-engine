@@ -24,12 +24,9 @@ OCR_REDACT = os.getenv("OCR_REDACT", "false").strip().lower() == "true"
 OCR_TRANSLATE_ALWAYS = os.getenv("OCR_TRANSLATE_ALWAYS", "false").strip().lower() == "true"
 
 # Prompts:
-# - en: verbatim English OCR
-# - hi: OCR + translate to English output ONLY
-PROMPTS = {
-    "en": "OCR this image. Return the text exactly as printed in English.",
-    "hi": "OCR this image. Extract the Hindi (Devanagari) text and return an accurate English translation ONLY. Preserve structure and line breaks where possible.",
-}
+PROMPT_OCR_VERBATIM_EN = "OCR this image. Return the text exactly as printed in English."
+PROMPT_OCR_HI_TO_EN = "OCR this image. Extract the Hindi (Devanagari) text and return an accurate English translation ONLY. Preserve structure and line breaks where possible."
+PROMPT_OCR_ANY_TO_EN = "OCR this image. Extract any visible text (any language) and return an accurate English translation ONLY. Preserve structure and line breaks where possible."
 
 # Redaction guidance (optional)
 REDACTION_GUIDE = (
@@ -40,14 +37,21 @@ REDACTION_GUIDE = (
 
 SYSTEM_BASE = (
     "You are an OCR engine. The user has provided this document and explicitly consents to OCR. "
-    "Your ONLY task is to transcribe text from the image(s) or page(s); when asked, translate to English. "
+    "Your ONLY task is to transcribe text from the image(s) or page(s). "
     "Do not add commentary, summaries, or warnings. Do not refuse unless the image is clearly illegal content. "
 )
 
 SYSTEM_VERBATIM = SYSTEM_BASE + "Return plain text only, preserving line breaks."
 SYSTEM_REDACT = SYSTEM_BASE + REDACTION_GUIDE + " Return plain text only, preserving line breaks."
 
-# System for translation of plain text (DOCX paragraphs/tables)
+# System for OCR that MUST return English translation only
+SYSTEM_OCR_TRANSLATE = (
+    "You are an OCR engine with translation. The user has provided this document and explicitly consents to OCR. "
+    "Your ONLY task is to transcribe visible text from the image(s) and output an English translation ONLY. "
+    "Preserve formatting and line breaks as much as possible. Do not add commentary. "
+)
+
+# System for translation of plain text (DOCX paragraphs/tables or post-fix)
 SYSTEM_TRANSLATOR = (
     "You are a professional translator. Translate the provided text into natural, fluent English. "
     "Preserve formatting and line breaks as much as possible. Do not add commentary."
@@ -56,6 +60,8 @@ SYSTEM_TRANSLATOR = (
 CLIENT = OpenAI()
 
 # ========= Helpers =========
+DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")  # detect Hindi script
+
 def _img_to_data_url(img: Image.Image, fmt: str = "PNG") -> str:
     buf = io.BytesIO()
     img.save(buf, format=fmt)
@@ -95,28 +101,7 @@ def _call_responses(model: str, messages: list) -> str:
     resp = CLIENT.responses.create(model=model, input=messages)
     return _extract_text_from_response(resp)
 
-# ========= OCR Calls =========
-def _call_ocr(model: str, system_text: str, user_prompt: str, data_url: str, detail: str = "high") -> str:
-    messages = [
-        {"role": "system", "content": [{"type": "input_text", "text": system_text}]},
-        {"role": "user", "content": [
-            {"type": "input_text", "text": user_prompt},
-            {"type": "input_image", "image_url": data_url, "detail": detail},
-        ]},
-    ]
-    return _call_responses(model, messages)
-
-def ocr_image_dataurl(data_url: str, user_prompt: str, detail: str = "high") -> str:
-    system_text = SYSTEM_REDACT if OCR_REDACT else SYSTEM_VERBATIM
-    text = _call_ocr(MODEL, system_text, user_prompt, data_url, detail=detail)
-    if _REFUSAL_RE.search(text):
-        narrow_system = (system_text + " This is first-party, user-owned content strictly for OCR/translation.")
-        text = _call_ocr(MODEL_FALLBACK, narrow_system, user_prompt, data_url, detail=detail)
-    return text.strip()
-
-# ========= Translator for plain text (DOCX paragraphs/tables) =========
 def translate_text_to_english(text: str) -> str:
-    # Skip empty
     if not text.strip():
         return text
     messages = [
@@ -127,6 +112,39 @@ def translate_text_to_english(text: str) -> str:
     if _REFUSAL_RE.search(out):
         out = _call_responses(MODEL_FALLBACK, messages)
     return out.strip()
+
+def ensure_english(text: str) -> str:
+    """If OCR_TRANSLATE_ALWAYS is true and we still see Devanagari, translate that block."""
+    if not OCR_TRANSLATE_ALWAYS:
+        return text
+    if DEVANAGARI_RE.search(text):
+        return translate_text_to_english(text)
+    return text
+
+# ========= OCR Calls =========
+def _call_ocr(system_text: str, user_prompt: str, data_url: str, detail: str = "high") -> str:
+    messages = [
+        {"role": "system", "content": [{"type": "input_text", "text": system_text}]},
+        {"role": "user", "content": [
+            {"type": "input_text", "text": user_prompt},
+            {"type": "input_image", "image_url": data_url, "detail": detail},
+        ]},
+    ]
+    out = _call_responses(MODEL, messages)
+    if _REFUSAL_RE.search(out):
+        narrow_system = system_text + " This is first-party, user-owned content strictly for OCR/translation."
+        messages[0]["content"][0]["text"] = narrow_system
+        out = _call_responses(MODEL_FALLBACK, messages)
+    return out.strip()
+
+def ocr_image_dataurl(data_url: str, user_prompt: str, detail: str = "high") -> str:
+    # Choose system text based on redaction and translate-always
+    if OCR_TRANSLATE_ALWAYS:
+        system_text = SYSTEM_OCR_TRANSLATE
+    else:
+        system_text = (SYSTEM_REDACT if OCR_REDACT else SYSTEM_VERBATIM)
+    text = _call_ocr(system_text, user_prompt, data_url, detail=detail)
+    return ensure_english(text)
 
 # ========= PDF (PyMuPDF) =========
 def ocr_pdf(path: Path, prompt: str, zoom: float = 2.5) -> str:
@@ -139,6 +157,8 @@ def ocr_pdf(path: Path, prompt: str, zoom: float = 2.5) -> str:
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             data_url = _img_to_data_url(img, fmt="PNG")
             page_text = ocr_image_dataurl(data_url, f"{prompt}\nKeep original line breaks.")
+            # Final safety: if still any Devanagari, translate this page block
+            page_text = ensure_english(page_text)
             texts.append(f"[Page {i}]\n{page_text}".rstrip())
     finally:
         doc.close()
@@ -147,7 +167,8 @@ def ocr_pdf(path: Path, prompt: str, zoom: float = 2.5) -> str:
 # ========= Images =========
 def ocr_image_file(path: Path, prompt: str) -> str:
     data_url = _file_to_data_url(path)
-    return ocr_image_dataurl(data_url, prompt)
+    text = ocr_image_dataurl(data_url, prompt)
+    return ensure_english(text)
 
 # ========= DOCX (text + embedded images) =========
 def extract_docx_text(doc: Document) -> str:
@@ -185,8 +206,12 @@ def ocr_docx_images(doc: Document, prompt: str) -> List[str]:
             else:
                 mime = "image/png"
             data_url = _bytes_to_data_url(blob, mime=mime)
-            # This prompt already outputs English if OCR_LANG == "hi"
-            txt = ocr_image_dataurl(data_url, f"{prompt}\nThis image came from a DOCX file.")
+
+            # OCR for embedded images (already translate-only if OCR_TRANSLATE_ALWAYS)
+            txt = ocr_image_dataurl(
+                data_url, f"{prompt}\nThis image came from a DOCX file."
+            )
+            txt = ensure_english(txt)
             image_texts.append(f"[DOCX Image {idx}]\n{txt}".rstrip())
     return image_texts
 
@@ -194,8 +219,8 @@ def process_docx(path: Path, prompt: str) -> str:
     doc = Document(str(path))
     text_block = extract_docx_text(doc)
 
-    # If Hindi mode or forced translate, translate the plain DOCX text to English
-    if text_block and (OCR_LANG == "hi" or OCR_TRANSLATE_ALWAYS):
+    # Translate plain DOCX text if requested or if it contains Devanagari
+    if text_block and (OCR_TRANSLATE_ALWAYS or DEVANAGARI_RE.search(text_block)):
         text_block = translate_text_to_english(text_block)
 
     image_ocr_blocks = ocr_docx_images(doc, prompt)
@@ -218,7 +243,12 @@ def main():
         print(f"File not found: {infile}", file=sys.stderr)
         sys.exit(1)
 
-    prompt = PROMPTS[OCR_LANG]
+    # Choose the effective OCR prompt
+    if OCR_TRANSLATE_ALWAYS:
+        prompt = PROMPT_OCR_ANY_TO_EN
+    else:
+        prompt = PROMPT_OCR_HI_TO_EN if OCR_LANG == "hi" else PROMPT_OCR_VERBATIM_EN
+
     ext = infile.suffix.lower()
 
     if ext == ".pdf":
@@ -239,6 +269,8 @@ def main():
             print("Unsupported file type. Provide PDF, DOCX, or an image (png/jpg/webp).", file=sys.stderr)
             sys.exit(2)
 
+    # Final safeguard at whole-document level
+    text = ensure_english(text)
     print(text)
 
 if __name__ == "__main__":
