@@ -10,8 +10,9 @@ from typing import Dict, List, Tuple
 
 import fitz  # PyMuPDF
 from PIL import Image
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, status
 from fastapi.responses import PlainTextResponse
+from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from docx import Document
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from openai import OpenAI
@@ -24,7 +25,37 @@ app = FastAPI(title="OCR Intake Parser", version="1.0.0")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 MODEL_FALLBACK = os.getenv("OPENAI_MODEL_FALLBACK", "gpt-4.1-mini")
 
+# OpenAI client with generous timeout + retries
 CLIENT = OpenAI(timeout=600.0, max_retries=5)
+
+# =========================
+# Auth (SECRET_API_KEY)
+# =========================
+SECRET_API_KEY = os.getenv("SECRET_API_KEY")
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+_http_bearer = HTTPBearer(auto_error=False)
+
+def require_api_key(
+    api_key_header: str | None = Depends(_api_key_header),
+    bearer: HTTPAuthorizationCredentials | None = Depends(_http_bearer),
+):
+    if not SECRET_API_KEY:
+        # Fail closed if you forgot to set the key on the server
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Server not configured with SECRET_API_KEY",
+        )
+    supplied = None
+    if api_key_header:
+        supplied = api_key_header.strip()
+    elif bearer and bearer.scheme.lower() == "bearer":
+        supplied = (bearer.credentials or "").strip()
+    if not supplied or supplied != SECRET_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing API key",
+        )
+    return True
 
 # =========================
 # Intake fields schema
@@ -179,7 +210,6 @@ def structured_from_messages(messages: list, schema: dict) -> Dict:
     except TypeError:
         # Old SDK: enforce JSON via prompt
         strong = list(messages)
-        # Make sure last user block has the instruction
         for blk in strong[-1]["content"]:
             if blk.get("type") == "input_text":
                 blk["text"] += "\n\nReturn ONLY a minified JSON object (no prose, no code fences)."
@@ -211,7 +241,6 @@ def ocr_image_dataurl_structured(data_url: str, translate_always: bool) -> Dict:
         ]},
     ]
     out = structured_from_messages(messages, intake_schema())
-    # Defensive: ensure English if asked
     if translate_always:
         for k, v in list(out.items()):
             if isinstance(v, str) and DEVANAGARI_RE.search(v):
@@ -247,9 +276,10 @@ def extract_docx_text(doc: Document) -> str:
     return "\n".join(parts).strip()
 
 def extract_from_docx(blob: bytes, translate_always: bool) -> Dict:
-    # 1) selectable text → structured
     doc = Document(io.BytesIO(blob))
     merged: Dict = {}
+
+    # 1) selectable text -> structured
     selectable = extract_docx_text(doc)
     if selectable:
         if translate_always and DEVANAGARI_RE.search(selectable):
@@ -264,9 +294,8 @@ def extract_from_docx(blob: bytes, translate_always: bool) -> Dict:
         d1 = structured_from_messages(messages, intake_schema())
         merged = merge_keep_longer(merged, d1)
 
-    # 2) embedded images → OCR → structured
+    # 2) embedded images -> OCR -> structured
     rels = list(doc.part.rels.values())
-    labels_hint = "; ".join([f["label"] for f in INTAKE_FIELDS])
     for rel in rels:
         if rel.reltype == RT.IMAGE:
             part = rel.target_part
@@ -287,6 +316,7 @@ def extract_from_docx(blob: bytes, translate_always: bool) -> Dict:
             data_url = bytes_to_data_url(raw, mime=mime)
             d2 = ocr_image_dataurl_structured(data_url, translate_always)
             merged = merge_keep_longer(merged, d2)
+
     return merged
 
 def detect_type(filename: str, blob: bytes) -> str:
@@ -304,15 +334,12 @@ def detect_type(filename: str, blob: bytes) -> str:
         return "docx"
     if mime and mime.startswith("image/"):
         return "image"
-    # last resort: sniff a bit
     if blob[:5] == b"%PDF-":
         return "pdf"
-    return "image"  # default
+    return "image"
 
 def parse_file(filename: str, blob: bytes, lang: str) -> Dict:
-    # lang: "hi" => translate to English; "en" => no forced translation
     translate_always = (lang or "en").lower() == "hi"
-
     kind = detect_type(filename, blob)
     if kind == "pdf":
         return extract_from_pdf(blob, translate_always)
@@ -327,36 +354,35 @@ def parse_file(filename: str, blob: bytes, lang: str) -> Dict:
 @app.post("/parse", response_class=PlainTextResponse)
 async def parse(
     files: List[UploadFile] = File(..., description="List of files (PDF/PNG/JPG/WEBP/DOCX)"),
-    langs: List[str] = Form(..., description="List of language tags (en/hi) in the same order as files")
+    langs: List[str] = Form(..., description="List of language tags (en/hi) in the same order as files"),
+    _auth_ok: bool = Depends(require_api_key),
 ) -> PlainTextResponse:
-    # --- Robust input normalization ---
-    # 1) Strip empties from files (Swagger sometimes adds blank rows)
+    # Robust array handling for Swagger/curl
     files = [f for f in files if getattr(f, "filename", None)]
-
-    # 2) If Swagger sent a single 'hi,en' value, split it
     if len(langs) == 1:
         langs = [s.strip() for s in re.split(r"[,\s]+", langs[0]) if s.strip()]
-
-    # 3) Remove empty lang items and lower-case
     langs = [l.strip().lower() for l in langs if l and l.strip()]
-
-    # 4) Auto-pad/truncate to match files count (default to 'en')
     if len(langs) < len(files):
-        langs = langs + (["en"] * (len(files) - len(langs)))
+        langs += ["en"] * (len(files) - len(langs))
     elif len(langs) > len(files):
         langs = langs[:len(files)]
-
-    # 5) Validate langs
     bad = [l for l in langs if l not in {"en", "hi"}]
     if bad:
         raise HTTPException(status_code=400, detail=f"Invalid language(s): {bad}. Use 'en' or 'hi'.")
 
-    # --- Your existing per-file parsing logic below ---
-    result = {}
+    result: Dict[str, str] = {}
     for idx, uf in enumerate(files):
         blob = await uf.read()
         lang = langs[idx]
-        parsed_obj = parse_file(uf.filename, blob, lang)  # <- your existing function
+        parsed_obj = parse_file(uf.filename, blob, lang)
         result[uf.filename] = json.dumps(parsed_obj, ensure_ascii=False)
 
+    # Return a JSON string mapping filename -> JSON string of extracted fields
     return PlainTextResponse(content=json.dumps(result, ensure_ascii=False), media_type="application/json")
+
+# Optional health for liveness checks
+@app.get("/health")
+def health():
+    if not SECRET_API_KEY:
+        return {"ok": False, "error": "SECRET_API_KEY not set"}
+    return {"ok": True}
