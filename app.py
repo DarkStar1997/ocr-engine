@@ -45,7 +45,7 @@ app.add_middleware(
 # =========================
 # Config / Model selection
 # =========================
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 MODEL_FALLBACK = os.getenv("OPENAI_MODEL_FALLBACK", "gpt-4.1-mini")
 
 # OpenAI client with generous timeout + retries
