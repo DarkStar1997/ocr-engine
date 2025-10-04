@@ -13,11 +13,33 @@ from PIL import Image
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, status
 from fastapi.responses import PlainTextResponse
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
 from docx import Document
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from openai import OpenAI
 
 app = FastAPI(title="OCR Intake Parser", version="1.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        # add prod origins/domains here as needed
+        # "https://your-frontend.example.com",
+    ],
+    allow_credentials=False,             # you aren't using cookies
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=[
+        "Authorization",
+        "X-API-Key",
+        "Content-Type",
+        "Accept",
+        # optionally: "X-Requested-With"
+    ],
+    expose_headers=[],                   # add if you need to read custom response headers
+    max_age=86400,                       # cache preflight 1 day
+)
 
 # =========================
 # Config / Model selection
