@@ -25,12 +25,20 @@ if OCR_LANG not in {"en", "hi"}:
 # Modes
 OCR_REDACT = os.getenv("OCR_REDACT", "false").strip().lower() == "true"
 OCR_TRANSLATE_ALWAYS = os.getenv("OCR_TRANSLATE_ALWAYS", "false").strip().lower() == "true"
-OCR_STRUCTURED = os.getenv("OCR_STRUCTURED", "false").strip().lower() == "true"
+OCR_STRUCTURED = os.getenv("OCR_STRUCTURED", "true").strip().lower() == "true"
 
 # Prompts (free-text OCR mode)
-PROMPT_OCR_VERBATIM_EN = "OCR this image. Return the text exactly as printed in English."
-PROMPT_OCR_HI_TO_EN = "OCR this image. Extract the Hindi (Devanagari) text and return an accurate English translation ONLY. Preserve structure and line breaks where possible."
-PROMPT_OCR_ANY_TO_EN = "OCR this image. Extract any visible text (any language) and return an accurate English translation ONLY. Preserve structure and line breaks where possible."
+PROMPT_OCR_VERBATIM_EN = (
+    "OCR this image. Return the text exactly as printed in English."
+)
+PROMPT_OCR_HI_TO_EN = (
+    "OCR this image. Extract the Hindi (Devanagari) text and return an accurate English translation ONLY. "
+    "Preserve structure and line breaks where possible."
+)
+PROMPT_OCR_ANY_TO_EN = (
+    "OCR this image. Extract any visible text (any language) and return an accurate English translation ONLY. "
+    "Preserve structure and line breaks where possible."
+)
 
 # Redaction guidance (optional)
 REDACTION_GUIDE = (
@@ -46,7 +54,7 @@ SYSTEM_BASE = (
     "Do not add commentary, summaries, or warnings. Do not refuse unless the image is clearly illegal content. "
 )
 SYSTEM_VERBATIM = SYSTEM_BASE + "Return plain text only, preserving line breaks."
-SYSTEM_REDACT = SYSTEM_BASE + REDACTION_GUIDE + " Return plain text only, preserving line breaks."
+SYSTEM_REDACT_SYS = SYSTEM_BASE + REDACTION_GUIDE + " Return plain text only, preserving line breaks."
 SYSTEM_OCR_TRANSLATE = (
     "You are an OCR engine with translation. The user has provided this document and explicitly consents to OCR. "
     "Your ONLY task is to transcribe visible text from the image(s) and output an English translation ONLY. "
@@ -152,26 +160,57 @@ def _extract_text_from_response(resp) -> str:
 
 _REFUSAL_RE = re.compile(r"\b(i'?m|i am|sorry|cannot|can'?t|unable|assist)\b", re.I)
 
-def _call_responses(model: str, messages: list, **kwargs) -> str:
-    resp = CLIENT.responses.create(model=model, input=messages, **kwargs)
+# ---- JSON-structured extraction compatibility helpers ----
+_JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+def _first_json_object(text: str):
+    """Return the first JSON object found in text, else {}."""
+    if not text:
+        return {}
+    m = _JSON_OBJ_RE.search(text)
+    if not m:
+        return {}
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return {}
+
+def _call_responses(model: str, messages: list) -> str:
+    resp = CLIENT.responses.create(model=model, input=messages)
     return _extract_text_from_response(resp)
 
-def translate_text_to_english(text: str) -> str:
-    if not text.strip():
-        return text
-    messages = [
-        {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_TRANSLATOR}]},
-        {"role": "user", "content": [{"type": "input_text", "text": text}]},
-    ]
-    out = _call_responses(MODEL, messages)
-    if _REFUSAL_RE.search(out):
-        out = _call_responses(MODEL_FALLBACK, messages)
-    return out.strip()
-
-def ensure_english(text: str) -> str:
-    if OCR_TRANSLATE_ALWAYS and DEVANAGARI_RE.search(text):
-        return translate_text_to_english(text)
-    return text
+def call_structured_with_schema(messages: list, schema: dict) -> dict:
+    """
+    Try to call Responses API with json_schema. If the SDK doesn't support
+    'response_format', fall back to prompt-only JSON and parse.
+    """
+    try:
+        resp = CLIENT.responses.create(
+            model=MODEL,
+            input=messages,
+            response_format={"type": "json_schema", "json_schema": schema},
+        )
+        out = getattr(resp, "output_parsed", None)
+        if out is not None:
+            return out
+        # SDK didn't give parsed dict; try parsing text
+        return _first_json_object(_extract_text_from_response(resp))
+    except TypeError:
+        # Older SDK: no response_format. Force JSON via prompt and parse.
+        strong_msgs = list(messages)
+        # Strengthen the last user block to enforce raw JSON
+        # Find last input_text block
+        for blk in strong_msgs[-1]["content"]:
+            if blk.get("type") == "input_text":
+                blk["text"] += "\n\nReturn ONLY a minified JSON object (no prose, no code fences)."
+                break
+        raw = _call_responses(MODEL, strong_msgs)
+        out = _first_json_object(raw)
+        if out:
+            return out
+        # Fallback model if still not JSON
+        raw2 = _call_responses(MODEL_FALLBACK, strong_msgs)
+        return _first_json_object(raw2) or {}
 
 # ========= JSON Schema for extraction =========
 def intake_schema() -> Dict:
@@ -195,13 +234,31 @@ def merge_keep_longer(dst: Dict, src: Dict) -> Dict:
             dst[k] = v
     return dst
 
+# ========= Translation helpers =========
+def translate_text_to_english(text: str) -> str:
+    if not text.strip():
+        return text
+    messages = [
+        {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_TRANSLATOR}]},
+        {"role": "user", "content": [{"type": "input_text", "text": text}]},
+    ]
+    out = _call_responses(MODEL, messages)
+    if _REFUSAL_RE.search(out):
+        out = _call_responses(MODEL_FALLBACK, messages)
+    return out.strip()
+
+def ensure_english(text: str) -> str:
+    if OCR_TRANSLATE_ALWAYS and DEVANAGARI_RE.search(text):
+        return translate_text_to_english(text)
+    return text
+
 # ========= OCR Calls =========
 def ocr_image_dataurl_text(data_url: str, user_prompt: str, detail: str = "high") -> str:
-    # (Legacy text OCR mode)
     if OCR_TRANSLATE_ALWAYS:
         system_text = SYSTEM_OCR_TRANSLATE
     else:
-        system_text = (SYSTEM_REDACT if OCR_REDACT else SYSTEM_VERBATIM)
+        system_text = (SYSTEM_REDACT_SYS if OCR_REDACT else SYSTEM_VERBATIM)
+
     messages = [
         {"role": "system", "content": [{"type": "input_text", "text": system_text}]},
         {"role": "user", "content": [
@@ -218,9 +275,9 @@ def ocr_image_dataurl_text(data_url: str, user_prompt: str, detail: str = "high"
 def ocr_image_dataurl_structured(data_url: str, labels_hint: str = "", detail: str = "high") -> Dict:
     """
     OCR + extract to schema'd JSON. Returns a dict (omit-not-found).
+    Compatible with older SDKs lacking response_format.
     """
     system_text = SYSTEM_STRUCTURED
-    # Build a concise hint including labels (helps mapping)
     if not labels_hint:
         labels_hint = "; ".join([f['label'] for f in INTAKE_FIELDS])
 
@@ -239,36 +296,9 @@ def ocr_image_dataurl_structured(data_url: str, labels_hint: str = "", detail: s
     ]
 
     schema = intake_schema()
-    # Ask for structured JSON
-    resp = CLIENT.responses.create(
-        model=MODEL,
-        input=messages,
-        response_format={"type": "json_schema", "json_schema": schema},
-    )
-    out = getattr(resp, "output_parsed", None)
-    if out is None:  # fallback if SDK shape differs
-        parsed = _extract_text_from_response(resp)
-        try:
-            out = json.loads(parsed)
-        except Exception:
-            out = {}
+    out = call_structured_with_schema(messages, schema)
 
-    # Fallback model if refusal-ish or empty
-    if (not out) or (isinstance(out, dict) and not out) :
-        resp2 = CLIENT.responses.create(
-            model=MODEL_FALLBACK,
-            input=messages,
-            response_format={"type": "json_schema", "json_schema": schema},
-        )
-        out = getattr(resp2, "output_parsed", None) or {}
-        if not out:
-            parsed2 = _extract_text_from_response(resp2)
-            try:
-                out = json.loads(parsed2)
-            except Exception:
-                out = {}
-
-    # Ensure English if needed (defensive)
+    # Ensure English defensively
     for k, v in list(out.items()):
         if isinstance(v, str) and DEVANAGARI_RE.search(v):
             out[k] = translate_text_to_english(v)
@@ -357,21 +387,20 @@ def ocr_docx_images_structured(doc: Document) -> Dict:
 def process_docx_free_text(path: Path, prompt: str) -> str:
     doc = Document(str(path))
     text_block = extract_docx_text(doc)
-    # translate if asked or if Hindi detected
     if text_block and (OCR_TRANSLATE_ALWAYS or DEVANAGARI_RE.search(text_block)):
         text_block = translate_text_to_english(text_block)
-    # images to text blocks too (for free-text mode, we’ll just append)
     return text_block
 
 def process_docx_structured(path: Path) -> Dict:
     doc = Document(str(path))
     text_block = extract_docx_text(doc)
+
     # 1) Extract from selectable text
     selectable_extraction = {}
     if text_block:
-        # Translate selectable text if requested
         if OCR_TRANSLATE_ALWAYS or DEVANAGARI_RE.search(text_block):
             text_block = translate_text_to_english(text_block)
+
         messages = [
             {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_STRUCTURED}]},
             {"role": "user", "content": [{"type": "input_text",
@@ -380,18 +409,7 @@ def process_docx_structured(path: Path) -> Dict:
                          "Text:\n" + text_block)}]},
         ]
         schema = intake_schema()
-        resp = CLIENT.responses.create(
-            model=MODEL,
-            input=messages,
-            response_format={"type": "json_schema", "json_schema": schema},
-        )
-        selectable_extraction = getattr(resp, "output_parsed", None) or {}
-        if not selectable_extraction:
-            parsed = _extract_text_from_response(resp)
-            try:
-                selectable_extraction = json.loads(parsed)
-            except Exception:
-                selectable_extraction = {}
+        selectable_extraction = call_structured_with_schema(messages, schema)
 
     # 2) Extract from embedded images (OCR)
     image_extraction = ocr_docx_images_structured(doc)
@@ -405,12 +423,12 @@ def process_docx_structured(path: Path) -> Dict:
 # ========= Main =========
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python ocr_any.py <file.(pdf|png|jpg|jpeg|webp|docx)>", file=sys.stderr)
+        print(json.dumps({"error": "usage", "message": "python ocr_any.py <file.(pdf|png|jpg|jpeg|webp|docx)>"}))
         sys.exit(1)
 
     infile = Path(sys.argv[1]).expanduser().resolve()
     if not infile.exists():
-        print(f"File not found: {infile}", file=sys.stderr)
+        print(json.dumps({"error": "not_found", "path": str(infile)}))
         sys.exit(1)
 
     # Choose the effective prompt for free-text OCR mode
@@ -420,8 +438,9 @@ def main():
         prompt = PROMPT_OCR_HI_TO_EN if OCR_LANG == "hi" else PROMPT_OCR_VERBATIM_EN
 
     ext = infile.suffix.lower()
+
+    # ---- Structured JSON output ----
     if OCR_STRUCTURED:
-        # ---- Structured JSON output ----
         if ext == ".pdf":
             result = ocr_pdf_structured(infile, zoom=2.5)
         elif ext in {".png", ".jpg", ".jpeg", ".webp"}:
@@ -437,14 +456,14 @@ def main():
             elif ext == ".docx" or (mime and mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"):
                 result = process_docx_structured(infile)
             else:
-                print("Unsupported file type. Provide PDF, DOCX, or an image (png/jpg/webp).", file=sys.stderr)
+                print(json.dumps({"error": "unsupported_type", "path": str(infile)}))
                 sys.exit(2)
 
-        # Print strict JSON string (omit-empty is already handled by the schema+prompts)
+        # Always emit JSON string for structured mode
         print(json.dumps(result, ensure_ascii=False))
         return
 
-    # ---- Free-text OCR (previous behavior) ----
+    # ---- Free-text OCR (wrapped as JSON) ----
     if ext == ".pdf":
         text = ocr_pdf_free_text(infile, prompt, zoom=2.5)
     elif ext in {".png", ".jpg", ".jpeg", ".webp"}:
@@ -460,9 +479,10 @@ def main():
         elif ext == ".docx" or (mime and mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"):
             text = process_docx_free_text(infile, prompt)
         else:
-            print("Unsupported file type. Provide PDF, DOCX, or an image (png/jpg/webp).", file=sys.stderr)
+            print(json.dumps({"error": "unsupported_type", "path": str(infile)}))
             sys.exit(2)
 
+    # Always emit JSON string for free-text mode
     print(json.dumps({"text": text}, ensure_ascii=False))
 
 if __name__ == "__main__":
