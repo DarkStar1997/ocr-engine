@@ -1,0 +1,1 @@
+docker run -d -p 8080:8080 -e OPENAI_API_KEY=$OPENAI_API_KEY -e MAX_WORKERS=1 -e TIMEOUT=600 -e SECRET_API_KEY=$SECRET_API_KEY ghcr.io/darkstar1997/ocr-engine
