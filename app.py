@@ -6,7 +6,7 @@ import json
 import base64
 import mimetypes
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import fitz  # PyMuPDF
 from PIL import Image
@@ -18,9 +18,9 @@ from docx import Document
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from openai import OpenAI
 
-app = FastAPI(title="OCR Intake Parser", version="1.2.1")
+app = FastAPI(title="OCR Intake Parser", version="1.7.0")
 
-# ---- CORS (as requested) ----
+# ---- CORS ----
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -29,7 +29,7 @@ app.add_middleware(
         # add prod origins/domains here as needed
         # "https://your-frontend.example.com",
     ],
-    allow_credentials=False,             # you aren't using cookies
+    allow_credentials=False,             # no cookies
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=[
         "Authorization",
@@ -38,8 +38,8 @@ app.add_middleware(
         "Accept",
         # optionally: "X-Requested-With"
     ],
-    expose_headers=[],                   # add if you need to read custom response headers
-    max_age=86400,                       # cache preflight 1 day
+    expose_headers=[],
+    max_age=86400,
 )
 
 # =========================
@@ -59,11 +59,10 @@ _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 _http_bearer = HTTPBearer(auto_error=False)
 
 def require_api_key(
-    api_key_header: str | None = Depends(_api_key_header),
-    bearer: HTTPAuthorizationCredentials | None = Depends(_http_bearer),
+    api_key_header: Optional[str] = Depends(_api_key_header),
+    bearer: Optional[HTTPAuthorizationCredentials] = Depends(_http_bearer),
 ):
     if not SECRET_API_KEY:
-        # Fail closed if you forgot to set the key on the server
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Server not configured with SECRET_API_KEY",
@@ -81,56 +80,39 @@ def require_api_key(
     return True
 
 # =========================
-# Intake fields schema
+# Dynamic field helpers (labels only -> keys)
 # =========================
-INTAKE_FIELDS = [
-  { "key": "applicant_name", "label": "Applicant Name" },
-  { "key": "co_applicant_name", "label": "Co-Applicant Name" },
-  { "key": "property_owner_name", "label": "Name of the Property Owner" },
-  { "key": "loan_type", "label": "Loan Type / Product Type" },
-  { "key": "application_number", "label": "Application Number" },
-  { "key": "developer_name", "label": "Developer’s Name" },
-  { "key": "flat", "label": "Flat" },
-  { "key": "property_address_doc", "label": "Property Address (as per Document)" },
-  { "key": "pincode", "label": "PIN Code (as per Document)" },
-  { "key": "usage_approved_as_per_plan", "label": "Usage approved as per Plan" },
-  { "key": "usage_as_per_cdp", "label": "Usage as per CDP/Master plan" },
-  { "key": "address_as_per_plan", "label": "Address as per Plan" },
-  { "key": "legal_documents", "label": "Legal Documents" },
-  { "key": "list_of_documents", "label": "List of Documents provided" },
-  { "key": "land_freehold_or_leasehold", "label": "Land Freehold / Leasehold, term of lease" },
-  { "key": "period_expired_balance_lease_rent", "label": "Period expired, balance and lease rent" },
-  { "key": "boundaries_deed_east", "label": "Boundaries EAST (As per Deed)" },
-  { "key": "boundaries_deed_west", "label": "Boundaries WEST (As per Deed)" },
-  { "key": "boundaries_deed_north", "label": "Boundaries NORTH (As per Deed)" },
-  { "key": "boundaries_deed_south", "label": "Boundaries SOUTH (As per Deed)" },
-  { "key": "dimensions_deed_east", "label": "Dimension EAST (As per Deed)" },
-  { "key": "dimensions_deed_west", "label": "Dimension WEST (As per Deed)" },
-  { "key": "dimensions_deed_north", "label": "Dimension NORTH (As per Deed)" },
-  { "key": "dimensions_deed_south", "label": "Dimension SOUTH (As per Deed)" },
-  { "key": "land_area_docs_sqyd", "label": "Land Area (Sqyds) as per Documents" },
-  { "key": "land_area_docs_sqmt", "label": "Land Area (Sqmt) as per Documents" },
-  { "key": "land_area_docs_sqft", "label": "Land Area (Sqft) as per Documents" },
-  { "key": "land_area_plan", "label": "Land/Plot Area as per plan" },
-  { "key": "type_of_plot", "label": "Type of plot" },
-  { "key": "final_land_area_uds", "label": "Final Land area / UDS considered" },
-  { "key": "document_area_sqft", "label": "Document Area (title deed)" },
-  { "key": "approved_area_plan_sqft", "label": "Approved Area (as per plan)" },
-  { "key": "sanction_approval_no", "label": "Sanctioned plans / approval no" },
-  { "key": "sanction_number_date", "label": "Number and Date" },
-  { "key": "property_documents", "label": "Property documents" },
-  { "key": "ownership_type", "label": "Ownership type (Leasehold/Freehold)" },
-  { "key": "amenities_idc", "label": "IDC" },
-  { "key": "amenities_edc", "label": "EDC" },
-  { "key": "amenities_power_backup", "label": "Power Backup" },
-  { "key": "amenities_plc", "label": "PLC" },
-  { "key": "amenities_car_parking", "label": "Car Parking" },
-  { "key": "amenities_others", "label": "Others" },
-  { "key": "floors_sanctioned", "label": "No. Of Floors Sanctioned" },
-  { "key": "floors_proposed", "label": "No. of floors Proposed" },
-]
+NON_ALNUM = re.compile(r"[^a-z0-9]+")
+DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
 
-def intake_schema_rich() -> Dict:
+def label_to_key(label: str) -> str:
+    s = (label or "").strip().lower()
+    s = NON_ALNUM.sub("_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    if not s:
+        s = "field"
+    return s[:80]  # safe cap
+
+def build_all_fields_from_labels(labels: List[str]) -> List[Dict[str, str]]:
+    """
+    From user-provided labels only, produce [{key,label}, ...] with dedup by key.
+    """
+    combined: List[Dict[str, str]] = []
+    seen: set = set()
+    for lbl in labels or []:
+        if not lbl:
+            continue
+        k = label_to_key(lbl)
+        if k not in seen:
+            combined.append({"key": k, "label": lbl})
+            seen.add(k)
+    return combined
+
+def intake_schema_rich(all_fields: List[Dict[str, str]]) -> Dict:
+    """
+    JSON schema where each key maps to {value, conf, source}.
+    """
     field_obj = {
         "type": "object",
         "properties": {
@@ -141,7 +123,7 @@ def intake_schema_rich() -> Dict:
         "required": ["value", "conf", "source"],
         "additionalProperties": False,
     }
-    props = {f["key"]: field_obj for f in INTAKE_FIELDS}
+    props = {f["key"]: field_obj for f in all_fields}
     return {
         "name": "IntakeExtractionWithConfidence",
         "schema": {"type": "object", "properties": props, "additionalProperties": False},
@@ -151,9 +133,6 @@ def intake_schema_rich() -> Dict:
 # =========================
 # Utils
 # =========================
-DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
-JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
-
 def first_json_object(text: str) -> Dict:
     if not text:
         return {}
@@ -210,6 +189,9 @@ def call_responses(messages: list, model: str = MODEL) -> str:
     return extract_text_from_response(resp)
 
 def structured_from_messages(messages: list, schema: dict) -> Dict:
+    """
+    Prefer JSON schema mode; if SDK lacks response_format, fall back to strict JSON prompting.
+    """
     try:
         resp = CLIENT.responses.create(
             model=MODEL,
@@ -262,15 +244,25 @@ DOC_INSTR_BASE = (
 def ocr_document_structured(
     filename: str,
     page_dataurls: List[Tuple[int, str]],  # (page_number starting at 1, data_url)
-    selectable_text: str | None,
+    selectable_text: Optional[str],
     translate_always: bool,
+    all_fields: List[Dict[str, str]],
 ) -> Dict:
-    labels_hint = "; ".join([f["label"] for f in INTAKE_FIELDS])
+    if not all_fields:
+        return {}
+
+    labels_hint = "; ".join([f["label"] for f in all_fields])
+    mapping_lines = "\n".join([f"- {f['label']} -> {f['key']}" for f in all_fields])
+
     sys_msg = DOC_INSTR_BASE
     if translate_always:
         sys_msg += " If any content is in Hindi (Devanagari), output the English translation in the field 'value'."
+
     user_intro = (
-        f"Document name: {filename}. Extract only these fields: {labels_hint}. "
+        f"Document name: {filename}.\n"
+        f"Extract only these fields (labels): {labels_hint}\n"
+        "Use the following key names in the JSON output (label -> key):\n"
+        f"{mapping_lines}\n"
         "Always include 'source' as 'FILENAME#page N' where N is the image page you used."
     )
 
@@ -287,8 +279,9 @@ def ocr_document_structured(
         {"role": "user", "content": content},
     ]
 
-    out = structured_from_messages(messages, intake_schema_rich())
+    out = structured_from_messages(messages, intake_schema_rich(all_fields))
 
+    # Normalize conf/source and translate if needed
     for k, obj in list(out.items()):
         if not isinstance(obj, dict):
             out[k] = {"value": str(obj), "conf": 0.5, "source": f"{filename}#page 1"}
@@ -303,47 +296,13 @@ def ocr_document_structured(
     return out
 
 # =========================
-# PDF compression (default ON)
-# =========================
-def compress_pdf_bytes(blob: bytes) -> bytes:
-    """
-    Rebuilds the PDF as image-only pages (JPEG) to shrink size and speed up OCR.
-    Defaults: 144 DPI, JPEG quality ~60.
-    """
-    target_dpi = 144
-    jpeg_quality = 60
-
-    src = fitz.open(stream=blob, filetype="pdf")
-    try:
-        out = fitz.open()
-        scale = max(1.0, target_dpi / 72.0)
-        mat = fitz.Matrix(scale, scale)
-        for page in src:
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
-            img_bytes = buf.getvalue()
-
-            w_pt = (pix.width * 72.0) / float(target_dpi)
-            h_pt = (pix.height * 72.0) / float(target_dpi)
-            newp = out.new_page(width=w_pt, height=h_pt)
-            rect = fitz.Rect(0, 0, w_pt, h_pt)
-            newp.insert_image(rect, stream=img_bytes)
-
-        return out.tobytes(deflate=True, garbage=4, clean=True, linear=True)
-    finally:
-        src.close()
-
-# =========================
-# Renderers for file types
+# Low-memory PDF rendering (default behaviour)
 # =========================
 def extract_from_pdf(
     blob: bytes,
     filename: str,
     translate_always: bool,
-    zoom: float = 2.5  # unused now; kept for signature compatibility
+    all_fields: List[Dict[str, str]],
 ) -> Dict:
     """
     Low-memory path: render each page to a capped-size JPEG and send
@@ -386,11 +345,12 @@ def extract_from_pdf(
         page_urls,
         selectable_text=None,
         translate_always=translate_always,
+        all_fields=all_fields,
     )
 
-def extract_from_image(filename: str, blob: bytes, translate_always: bool) -> Dict:
+def extract_from_image(filename: str, blob: bytes, translate_always: bool, all_fields: List[Dict[str, str]]) -> Dict:
     page_urls = [(1, file_to_data_url(filename, blob))]
-    return ocr_document_structured(filename, page_urls, selectable_text=None, translate_always=translate_always)
+    return ocr_document_structured(filename, page_urls, selectable_text=None, translate_always=translate_always, all_fields=all_fields)
 
 def extract_docx_text(doc: Document) -> str:
     parts: List[str] = []
@@ -404,7 +364,7 @@ def extract_docx_text(doc: Document) -> str:
                 parts.append(" | ".join(row_text))
     return "\n".join(parts).strip()
 
-def extract_from_docx(blob: bytes, filename: str, translate_always: bool) -> Dict:
+def extract_from_docx(blob: bytes, filename: str, translate_always: bool, all_fields: List[Dict[str, str]]) -> Dict:
     doc = Document(io.BytesIO(blob))
     text_block = extract_docx_text(doc)
     if text_block and translate_always and re.search(r"[\u0900-\u097F]", text_block):
@@ -431,7 +391,7 @@ def extract_from_docx(blob: bytes, filename: str, translate_always: bool) -> Dic
             pno += 1
             page_urls.append((pno, bytes_to_data_url(raw, mime=mime)))
 
-    return ocr_document_structured(filename, page_urls or [(1, file_to_data_url(filename, blob))], text_block, translate_always)
+    return ocr_document_structured(filename, page_urls or [(1, file_to_data_url(filename, blob))], text_block, translate_always, all_fields=all_fields)
 
 def detect_type(filename: str, blob: bytes) -> str:
     ext = Path(filename).suffix.lower()
@@ -452,16 +412,16 @@ def detect_type(filename: str, blob: bytes) -> str:
         return "pdf"
     return "image"
 
-def parse_file(filename: str, blob: bytes, lang: str) -> Dict:
+def parse_file(filename: str, blob: bytes, lang: str, all_fields: List[Dict[str, str]]) -> Dict:
     translate_always = (lang or "en").lower() == "hi"
     kind = detect_type(filename, blob)
 
     if kind == "pdf":
-        return extract_from_pdf(blob, filename, translate_always)
+        return extract_from_pdf(blob, filename, translate_always, all_fields=all_fields)
     elif kind == "docx":
-        return extract_from_docx(blob, filename, translate_always)
+        return extract_from_docx(blob, filename, translate_always, all_fields=all_fields)
     else:
-        return extract_from_image(filename, blob, translate_always)
+        return extract_from_image(filename, blob, translate_always, all_fields=all_fields)
 
 # =========================
 # API: /parse
@@ -470,9 +430,16 @@ def parse_file(filename: str, blob: bytes, lang: str) -> Dict:
 async def parse(
     files: List[UploadFile] = File(..., description="List of files (PDF/PNG/JPG/WEBP/DOCX)"),
     langs: List[str] = Form(..., description="List of language tags (en/hi) in the same order as files"),
+    fields_to_extract: List[str] = Form(
+        ...,
+        description="Mandatory: field labels to extract (repeat this field OR provide a comma/newline/semicolon-separated list)",
+    ),
     _auth_ok: bool = Depends(require_api_key),
 ) -> PlainTextResponse:
+    # Normalize files
     files = [f for f in files if getattr(f, "filename", None)]
+
+    # Normalize langs (supports 'hi,en' or repeated fields)
     if len(langs) == 1:
         langs = [s.strip() for s in re.split(r"[,\s]+", langs[0]) if s.strip()]
     langs = [l.strip().lower() for l in langs if l and l.strip()]
@@ -484,11 +451,30 @@ async def parse(
     if bad:
         raise HTTPException(status_code=400, detail=f"Invalid language(s): {bad}. Use 'en' or 'hi'.")
 
+    # Mandatory fields_to_extract: supports multiple rows or comma/newline/semicolon separated
+    if not fields_to_extract:
+        raise HTTPException(status_code=400, detail="fields_to_extract is required and cannot be empty.")
+    if len(fields_to_extract) == 1:
+        labels = [s.strip() for s in re.split(r"[,\n;]+", fields_to_extract[0]) if s.strip()]
+    else:
+        labels = []
+        for item in fields_to_extract:
+            labels.extend([s.strip() for s in re.split(r"[,\n;]+", item) if s.strip()])
+    labels = [lbl for lbl in labels if lbl]
+
+    if not labels:
+        raise HTTPException(status_code=400, detail="fields_to_extract must contain at least one non-empty label.")
+
+    # Build fields list solely from provided labels
+    all_fields = build_all_fields_from_labels(labels)
+
+    # Process files
     result: Dict[str, str] = {}
     for idx, uf in enumerate(files):
         blob = await uf.read()
         lang = langs[idx]
-        parsed_obj = parse_file(uf.filename, blob, lang)
+        parsed_obj = parse_file(uf.filename, blob, lang, all_fields=all_fields)
+        # Contract: filename -> JSON string (minified) of extracted fields
         result[uf.filename] = json.dumps(parsed_obj, ensure_ascii=False)
 
     return PlainTextResponse(content=json.dumps(result, ensure_ascii=False), media_type="application/json")
