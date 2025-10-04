@@ -18,8 +18,9 @@ from docx import Document
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from openai import OpenAI
 
-app = FastAPI(title="OCR Intake Parser", version="1.1.0")
+app = FastAPI(title="OCR Intake Parser", version="1.2.1")
 
+# ---- CORS (as requested) ----
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -38,7 +39,7 @@ app.add_middleware(
         # optionally: "X-Requested-With"
     ],
     expose_headers=[],                   # add if you need to read custom response headers
-    max_age=86400,                       # cache preflight 1 day
+    max_age=86400,                       # cache preflight 1 day
 )
 
 # =========================
@@ -130,11 +131,6 @@ INTAKE_FIELDS = [
 ]
 
 def intake_schema_rich() -> Dict:
-    """
-    JSON schema for structured extraction:
-    Each field key maps to an object with { value: string, conf: number[0,1], source: string }.
-    Omit keys not found.
-    """
     field_obj = {
         "type": "object",
         "properties": {
@@ -214,10 +210,6 @@ def call_responses(messages: list, model: str = MODEL) -> str:
     return extract_text_from_response(resp)
 
 def structured_from_messages(messages: list, schema: dict) -> Dict:
-    """
-    Try JSON Schema mode. If the SDK is older (no response_format), fall back
-    to a strong "return only JSON" prompt and parse.
-    """
     try:
         resp = CLIENT.responses.create(
             model=MODEL,
@@ -269,7 +261,7 @@ DOC_INSTR_BASE = (
 
 def ocr_document_structured(
     filename: str,
-    page_dataurls: List[Tuple[int, str]],  # list of (page_number starting at 1, data_url)
+    page_dataurls: List[Tuple[int, str]],  # (page_number starting at 1, data_url)
     selectable_text: str | None,
     translate_always: bool,
 ) -> Dict:
@@ -282,9 +274,7 @@ def ocr_document_structured(
         "Always include 'source' as 'FILENAME#page N' where N is the image page you used."
     )
 
-    # Build messages: one request including all pages (and an optional text blob)
     content = [{"type": "input_text", "text": user_intro}]
-    # include a 'section' label for each page so the model can reference page numbers
     for (pno, url) in page_dataurls:
         content.append({"type": "input_text", "text": f"Page {pno}:"})
         content.append({"type": "input_image", "image_url": url, "detail": "high"})
@@ -299,21 +289,52 @@ def ocr_document_structured(
 
     out = structured_from_messages(messages, intake_schema_rich())
 
-    # Defensive: ensure conf is 0..1, ensure source format, and translate residual hindi if requested
     for k, obj in list(out.items()):
         if not isinstance(obj, dict):
-            # convert plain string to object if older model returns strings
             out[k] = {"value": str(obj), "conf": 0.5, "source": f"{filename}#page 1"}
             obj = out[k]
         obj["conf"] = clamp_conf(obj.get("conf", 0.5))
         if not isinstance(obj.get("source"), str):
             obj["source"] = f"{filename}#page 1"
-        # If still Devanagari present and translate_always, translate just that value
         val = obj.get("value", "")
         if translate_always and isinstance(val, str) and re.search(r"[\u0900-\u097F]", val):
             obj["value"] = translate_to_english(val)
 
     return out
+
+# =========================
+# PDF compression (default ON)
+# =========================
+def compress_pdf_bytes(blob: bytes) -> bytes:
+    """
+    Rebuilds the PDF as image-only pages (JPEG) to shrink size and speed up OCR.
+    Defaults: 144 DPI, JPEG quality ~60.
+    """
+    target_dpi = 144
+    jpeg_quality = 60
+
+    src = fitz.open(stream=blob, filetype="pdf")
+    try:
+        out = fitz.open()
+        scale = max(1.0, target_dpi / 72.0)
+        mat = fitz.Matrix(scale, scale)
+        for page in src:
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
+            img_bytes = buf.getvalue()
+
+            w_pt = (pix.width * 72.0) / float(target_dpi)
+            h_pt = (pix.height * 72.0) / float(target_dpi)
+            newp = out.new_page(width=w_pt, height=h_pt)
+            rect = fitz.Rect(0, 0, w_pt, h_pt)
+            newp.insert_image(rect, stream=img_bytes)
+
+        return out.tobytes(deflate=True, garbage=4, clean=True, linear=True)
+    finally:
+        src.close()
 
 # =========================
 # Renderers for file types
@@ -346,11 +367,9 @@ def extract_docx_text(doc: Document) -> str:
 
 def extract_from_docx(blob: bytes, filename: str, translate_always: bool) -> Dict:
     doc = Document(io.BytesIO(blob))
-    # selectable text
     text_block = extract_docx_text(doc)
     if text_block and translate_always and re.search(r"[\u0900-\u097F]", text_block):
         text_block = translate_to_english(text_block)
-    # embedded images as pages
     page_urls: List[Tuple[int, str]] = []
     pno = 0
     for rel in list(doc.part.rels.values()):
@@ -397,6 +416,14 @@ def detect_type(filename: str, blob: bytes) -> str:
 def parse_file(filename: str, blob: bytes, lang: str) -> Dict:
     translate_always = (lang or "en").lower() == "hi"
     kind = detect_type(filename, blob)
+
+    # Always compress PDFs before processing (default behaviour)
+    if kind == "pdf":
+        try:
+            blob = compress_pdf_bytes(blob)
+        except Exception:
+            pass
+
     if kind == "pdf":
         return extract_from_pdf(blob, filename, translate_always)
     elif kind == "docx":
@@ -413,7 +440,6 @@ async def parse(
     langs: List[str] = Form(..., description="List of language tags (en/hi) in the same order as files"),
     _auth_ok: bool = Depends(require_api_key),
 ) -> PlainTextResponse:
-    # Robust array handling for Swagger/curl
     files = [f for f in files if getattr(f, "filename", None)]
     if len(langs) == 1:
         langs = [s.strip() for s in re.split(r"[,\s]+", langs[0]) if s.strip()]
@@ -431,10 +457,8 @@ async def parse(
         blob = await uf.read()
         lang = langs[idx]
         parsed_obj = parse_file(uf.filename, blob, lang)
-        # Return a JSON string per your contract
         result[uf.filename] = json.dumps(parsed_obj, ensure_ascii=False)
 
-    # Return a JSON string mapping filename -> JSON string of extracted fields
     return PlainTextResponse(content=json.dumps(result, ensure_ascii=False), media_type="application/json")
 
 # Optional health for liveness checks
