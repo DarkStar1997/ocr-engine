@@ -17,7 +17,7 @@ from docx import Document
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from openai import OpenAI
 
-app = FastAPI(title="OCR Intake Parser", version="1.0.0")
+app = FastAPI(title="OCR Intake Parser", version="1.1.0")
 
 # =========================
 # Config / Model selection
@@ -107,15 +107,26 @@ INTAKE_FIELDS = [
   { "key": "floors_proposed", "label": "No. of floors Proposed" },
 ]
 
-def intake_schema() -> Dict:
-    props = {f["key"]: {"type": "string"} for f in INTAKE_FIELDS}
-    return {
-        "name": "IntakeExtraction",
-        "schema": {
-            "type": "object",
-            "properties": props,
-            "additionalProperties": False,
+def intake_schema_rich() -> Dict:
+    """
+    JSON schema for structured extraction:
+    Each field key maps to an object with { value: string, conf: number[0,1], source: string }.
+    Omit keys not found.
+    """
+    field_obj = {
+        "type": "object",
+        "properties": {
+            "value":  {"type": "string"},
+            "conf":   {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "source": {"type": "string"},
         },
+        "required": ["value", "conf", "source"],
+        "additionalProperties": False,
+    }
+    props = {f["key"]: field_obj for f in INTAKE_FIELDS}
+    return {
+        "name": "IntakeExtractionWithConfidence",
+        "schema": {"type": "object", "properties": props, "additionalProperties": False},
         "strict": True,
     }
 
@@ -136,13 +147,14 @@ def first_json_object(text: str) -> Dict:
     except Exception:
         return {}
 
-def merge_keep_longer(dst: Dict, src: Dict) -> Dict:
-    for k, v in (src or {}).items():
-        if not v:
-            continue
-        if k not in dst or len(str(v)) > len(str(dst.get(k, ""))):
-            dst[k] = v
-    return dst
+def clamp_conf(x):
+    try:
+        v = float(x)
+    except Exception:
+        return 0.5
+    if v < 0: v = 0.0
+    if v > 1: v = 1.0
+    return v
 
 def img_to_data_url(img: Image.Image, fmt: str = "PNG") -> str:
     buf = io.BytesIO()
@@ -179,19 +191,6 @@ def call_responses(messages: list, model: str = MODEL) -> str:
     resp = CLIENT.responses.create(model=model, input=messages)
     return extract_text_from_response(resp)
 
-def translate_to_english(text: str) -> str:
-    if not text.strip():
-        return text
-    messages = [
-        {"role": "system", "content": [{"type": "input_text", "text":
-            "You are a professional translator. Translate to natural, fluent English. Preserve line breaks; no commentary."}]},
-        {"role": "user", "content": [{"type": "input_text", "text": text}]},
-    ]
-    out = call_responses(messages, MODEL)
-    if not out or out.lower().startswith(("sorry", "i can't", "i cannot", "i am sorry")):
-        out = call_responses(messages, MODEL_FALLBACK)
-    return out.strip()
-
 def structured_from_messages(messages: list, schema: dict) -> Dict:
     """
     Try JSON Schema mode. If the SDK is older (no response_format), fall back
@@ -208,11 +207,13 @@ def structured_from_messages(messages: list, schema: dict) -> Dict:
             return out
         return first_json_object(extract_text_from_response(resp))
     except TypeError:
-        # Old SDK: enforce JSON via prompt
         strong = list(messages)
         for blk in strong[-1]["content"]:
             if blk.get("type") == "input_text":
-                blk["text"] += "\n\nReturn ONLY a minified JSON object (no prose, no code fences)."
+                blk["text"] += (
+                    "\n\nReturn ONLY a minified JSON object (no prose, no code fences). "
+                    "For each present field include: {\"value\": string, \"conf\": number 0-1, \"source\": string}."
+                )
                 break
         raw = call_responses(strong, MODEL)
         out = first_json_object(raw)
@@ -221,47 +222,93 @@ def structured_from_messages(messages: list, schema: dict) -> Dict:
         raw2 = call_responses(strong, MODEL_FALLBACK)
         return first_json_object(raw2) or {}
 
-# =========================
-# OCR → Structured extract
-# =========================
-def ocr_image_dataurl_structured(data_url: str, translate_always: bool) -> Dict:
-    labels_hint = "; ".join([f["label"] for f in INTAKE_FIELDS])
+def translate_to_english(text: str) -> str:
+    if not text.strip():
+        return text
     messages = [
         {"role": "system", "content": [{"type": "input_text", "text":
-            "You are an information extraction engine. Extract ONLY requested fields; return strict JSON; omit missing; no fabrication."}]},
-        {"role": "user", "content": [
-            {"type": "input_text", "text":
-                ("Extract the following labeled fields from this page. "
-                 "Return only the JSON object. "
-                 + ("If a value is in Hindi, translate to English. " if translate_always else "")
-                 + "Do not include fields you cannot find. "
-                 f"Fields: {labels_hint}"
-                )},
-            {"type": "input_image", "image_url": data_url, "detail": "high"},
-        ]},
+            "You are a professional translator. Translate to natural, fluent English. Preserve line breaks; no commentary."}]},
+        {"role": "user", "content": [{"type": "input_text", "text": text}]},
     ]
-    out = structured_from_messages(messages, intake_schema())
+    out = call_responses(messages, MODEL)
+    if not out or out.lower().startswith(("sorry", "i can't", "i cannot", "i am sorry")):
+        out = call_responses(messages, MODEL_FALLBACK)
+    return out.strip()
+
+# =========================
+# Single-request document extraction
+# =========================
+DOC_INSTR_BASE = (
+    "You are an information extraction engine. Extract ONLY the requested fields from the provided content. "
+    "For each field you find, return an object with keys: value (string), conf (0-1, 1=very confident), "
+    "and source (use the format 'FILENAME#page N'). Omit any field that is not confidently present. "
+    "Do not fabricate values. Prioritize printed text on the images; you may also use the provided raw text."
+)
+
+def ocr_document_structured(
+    filename: str,
+    page_dataurls: List[Tuple[int, str]],  # list of (page_number starting at 1, data_url)
+    selectable_text: str | None,
+    translate_always: bool,
+) -> Dict:
+    labels_hint = "; ".join([f["label"] for f in INTAKE_FIELDS])
+    sys_msg = DOC_INSTR_BASE
     if translate_always:
-        for k, v in list(out.items()):
-            if isinstance(v, str) and DEVANAGARI_RE.search(v):
-                out[k] = translate_to_english(v)
+        sys_msg += " If any content is in Hindi (Devanagari), output the English translation in the field 'value'."
+    user_intro = (
+        f"Document name: {filename}. Extract only these fields: {labels_hint}. "
+        "Always include 'source' as 'FILENAME#page N' where N is the image page you used."
+    )
+
+    # Build messages: one request including all pages (and an optional text blob)
+    content = [{"type": "input_text", "text": user_intro}]
+    # include a 'section' label for each page so the model can reference page numbers
+    for (pno, url) in page_dataurls:
+        content.append({"type": "input_text", "text": f"Page {pno}:"})
+        content.append({"type": "input_image", "image_url": url, "detail": "high"})
+    if selectable_text:
+        content.append({"type": "input_text", "text": "Raw selectable text from the document follows:"})
+        content.append({"type": "input_text", "text": selectable_text})
+
+    messages = [
+        {"role": "system", "content": [{"type": "input_text", "text": sys_msg}]},
+        {"role": "user", "content": content},
+    ]
+
+    out = structured_from_messages(messages, intake_schema_rich())
+
+    # Defensive: ensure conf is 0..1, ensure source format, and translate residual hindi if requested
+    for k, obj in list(out.items()):
+        if not isinstance(obj, dict):
+            # convert plain string to object if older model returns strings
+            out[k] = {"value": str(obj), "conf": 0.5, "source": f"{filename}#page 1"}
+            obj = out[k]
+        obj["conf"] = clamp_conf(obj.get("conf", 0.5))
+        if not isinstance(obj.get("source"), str):
+            obj["source"] = f"{filename}#page 1"
+        # If still Devanagari present and translate_always, translate just that value
+        val = obj.get("value", "")
+        if translate_always and isinstance(val, str) and re.search(r"[\u0900-\u097F]", val):
+            obj["value"] = translate_to_english(val)
+
     return out
 
-def extract_from_pdf(blob: bytes, translate_always: bool, zoom: float = 2.5) -> Dict:
-    merged: Dict = {}
+# =========================
+# Renderers for file types
+# =========================
+def extract_from_pdf(blob: bytes, filename: str, translate_always: bool, zoom: float = 2.5) -> Dict:
+    page_urls: List[Tuple[int, str]] = []
     with fitz.open(stream=blob, filetype="pdf") as doc:
         mat = fitz.Matrix(zoom, zoom)
-        for page in doc:
+        for i, page in enumerate(doc, start=1):
             pix = page.get_pixmap(matrix=mat, alpha=False)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            data_url = img_to_data_url(img, fmt="PNG")
-            d = ocr_image_dataurl_structured(data_url, translate_always)
-            merged = merge_keep_longer(merged, d)
-    return merged
+            page_urls.append((i, img_to_data_url(img, fmt="PNG")))
+    return ocr_document_structured(filename, page_urls, selectable_text=None, translate_always=translate_always)
 
 def extract_from_image(filename: str, blob: bytes, translate_always: bool) -> Dict:
-    data_url = file_to_data_url(filename, blob)
-    return ocr_image_dataurl_structured(data_url, translate_always)
+    page_urls = [(1, file_to_data_url(filename, blob))]
+    return ocr_document_structured(filename, page_urls, selectable_text=None, translate_always=translate_always)
 
 def extract_docx_text(doc: Document) -> str:
     parts: List[str] = []
@@ -275,28 +322,16 @@ def extract_docx_text(doc: Document) -> str:
                 parts.append(" | ".join(row_text))
     return "\n".join(parts).strip()
 
-def extract_from_docx(blob: bytes, translate_always: bool) -> Dict:
+def extract_from_docx(blob: bytes, filename: str, translate_always: bool) -> Dict:
     doc = Document(io.BytesIO(blob))
-    merged: Dict = {}
-
-    # 1) selectable text -> structured
-    selectable = extract_docx_text(doc)
-    if selectable:
-        if translate_always and DEVANAGARI_RE.search(selectable):
-            selectable = translate_to_english(selectable)
-        messages = [
-            {"role": "system", "content": [{"type": "input_text", "text":
-                "You are an information extraction engine. Extract ONLY requested fields; return strict JSON; omit missing; no fabrication."}]},
-            {"role": "user", "content": [{"type": "input_text", "text":
-                "Extract ONLY the requested fields from this text. "
-                "Return only the JSON object. If a field is not found, omit it.\n\nText:\n" + selectable}]},
-        ]
-        d1 = structured_from_messages(messages, intake_schema())
-        merged = merge_keep_longer(merged, d1)
-
-    # 2) embedded images -> OCR -> structured
-    rels = list(doc.part.rels.values())
-    for rel in rels:
+    # selectable text
+    text_block = extract_docx_text(doc)
+    if text_block and translate_always and re.search(r"[\u0900-\u097F]", text_block):
+        text_block = translate_to_english(text_block)
+    # embedded images as pages
+    page_urls: List[Tuple[int, str]] = []
+    pno = 0
+    for rel in list(doc.part.rels.values()):
         if rel.reltype == RT.IMAGE:
             part = rel.target_part
             raw = part.blob
@@ -313,11 +348,10 @@ def extract_from_docx(blob: bytes, translate_always: bool) -> Dict:
                 mime = "image/tiff"
             else:
                 mime = "image/png"
-            data_url = bytes_to_data_url(raw, mime=mime)
-            d2 = ocr_image_dataurl_structured(data_url, translate_always)
-            merged = merge_keep_longer(merged, d2)
+            pno += 1
+            page_urls.append((pno, bytes_to_data_url(raw, mime=mime)))
 
-    return merged
+    return ocr_document_structured(filename, page_urls or [(1, file_to_data_url(filename, blob))], text_block, translate_always)
 
 def detect_type(filename: str, blob: bytes) -> str:
     ext = Path(filename).suffix.lower()
@@ -342,9 +376,9 @@ def parse_file(filename: str, blob: bytes, lang: str) -> Dict:
     translate_always = (lang or "en").lower() == "hi"
     kind = detect_type(filename, blob)
     if kind == "pdf":
-        return extract_from_pdf(blob, translate_always)
+        return extract_from_pdf(blob, filename, translate_always)
     elif kind == "docx":
-        return extract_from_docx(blob, translate_always)
+        return extract_from_docx(blob, filename, translate_always)
     else:
         return extract_from_image(filename, blob, translate_always)
 
@@ -375,6 +409,7 @@ async def parse(
         blob = await uf.read()
         lang = langs[idx]
         parsed_obj = parse_file(uf.filename, blob, lang)
+        # Return a JSON string per your contract
         result[uf.filename] = json.dumps(parsed_obj, ensure_ascii=False)
 
     # Return a JSON string mapping filename -> JSON string of extracted fields
