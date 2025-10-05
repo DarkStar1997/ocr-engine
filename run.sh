@@ -1,1 +1,1 @@
-docker run -d -p 8080:8080 -e OPENAI_API_KEY=$OPENAI_API_KEY -e MAX_WORKERS=1 -e TIMEOUT=600 -e SECRET_API_KEY=$SECRET_API_KEY ghcr.io/darkstar1997/ocr-engine
+docker run -d -p 80:8080 --memory="3200m" --restart unless-stopped -e OPENAI_API_KEY=$OPENAI_API_KEY -e MAX_WORKERS=4 -e TIMEOUT=600 -e MODEL="gpt-5" -e SECRET_API_KEY=$SECRET_API_KEY ghcr.io/darkstar1997/ocr-engine
