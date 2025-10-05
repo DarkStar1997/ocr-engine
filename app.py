@@ -22,6 +22,19 @@ from docx import Document
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from openai import OpenAI
 
+# ===== NEW: Google Vision / Storage =====
+from google.cloud import vision
+from google.cloud.vision_v1.types import (
+    Feature,
+    InputConfig,
+    OutputConfig,
+    GcsSource,
+    GcsDestination,
+    AsyncAnnotateFileRequest,
+)
+from google.cloud import storage
+from google.api_core.operation import Operation
+
 # =========================
 # Logging setup
 # =========================
@@ -41,7 +54,7 @@ def log(level: int, msg: str, **kv):
     kv_str = " ".join(f"{k}={v}" for k, v in kv.items())
     logger.log(level, f"[rid={rid()}] {msg}" + (f" | {kv_str}" if kv_str else ""))
 
-app = FastAPI(title="OCR Intake Parser", version="2.0.0")
+app = FastAPI(title="OCR Intake Parser", version="2.1.0-gcv")
 
 # ---- CORS ----
 app.add_middleware(
@@ -68,14 +81,27 @@ app.add_middleware(
 # =========================
 # Config / Model selection
 # =========================
-# Vision (for OCR fallback on scanned pages)
-MODEL = os.getenv("OPENAI_MODEL", "gpt-5")  # vision-capable
-# Text-only, cheaper model for interpretation
+# OpenAI: text-only model for interpretation stays the same
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5")  # kept for fallback only
 TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL") or os.getenv("OPENAI_MODEL_FALLBACK", "gpt-4.1-mini")
-
-# OpenAI client with generous timeout + retries
 CLIENT = OpenAI(timeout=600.0, max_retries=5)
-log(logging.INFO, "Server startup", openai_timeout=600, openai_retries=5, ocr_model=MODEL, text_model=TEXT_MODEL)
+log(logging.INFO, "Server startup", openai_timeout=600, openai_retries=5, text_model=TEXT_MODEL)
+
+# Google Vision defaults
+GCV_BUCKET = os.getenv("GCV_BUCKET", "ocr-storage-db").strip()
+GCV_PREFIX = os.getenv("GCV_PREFIX", "uploads/").strip().strip("/")  # e.g. "uploads"
+if GCV_PREFIX:
+    GCV_PREFIX = GCV_PREFIX + "/"
+
+# Init Vision + Storage clients (will raise if credentials missing)
+try:
+    VISION_CLIENT = vision.ImageAnnotatorClient()
+    STORAGE_CLIENT = storage.Client()
+    log(logging.INFO, "Google clients initialized", gcv_bucket=GCV_BUCKET, gcv_prefix=GCV_PREFIX or "(none)")
+except Exception as e:
+    VISION_CLIENT = None
+    STORAGE_CLIENT = None
+    log(logging.ERROR, "Google clients init failed", error=str(e))
 
 # =========================
 # Auth (SECRET_API_KEY)
@@ -207,84 +233,209 @@ def text_maybe_translate(text: str, translate: bool) -> str:
         return translate_to_english(text)
     return text
 
-# ---------- Data URL helpers (for OCR fallback) ----------
-def img_to_jpeg_data_url(img: Image.Image, quality: int = 52) -> str:
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=quality, optimize=True, progressive=True)
-    b = buf.getvalue()
-    log(logging.DEBUG, "Rendered JPEG", bytes=len(b), quality=quality, mode=img.mode, size=f"{img.width}x{img.height}")
-    return "data:image/jpeg;base64," + base64.b64encode(b).decode("utf-8")
+# =========================
+# Google Vision helpers (from google_vision.py, adapted)
+# =========================
+# Break types
+_BREAK_SPACE = 1
+_BREAK_EOL_SURE = 2
+_BREAK_SURE_SPACE = 3
+_BREAK_LINE_BREAK = 5
+
+def _word_text_proto(word) -> str:
+    return "".join(s.text or "" for s in word.symbols)
+
+def _word_break_proto(word) -> int | None:
+    if not word.symbols:
+        return None
+    last = word.symbols[-1]
+    if last.property and last.property.detected_break:
+        return last.property.detected_break.type
+    return None
+
+def _paragraph_lines_proto(paragraph) -> List[str]:
+    lines: List[str] = []
+    buf: List[str] = []
+    for w in paragraph.words:
+        wtxt = _word_text_proto(w)
+        if not wtxt:
+            continue
+        if buf and not buf[-1].endswith(" "):
+            buf.append(" ")
+        buf.append(wtxt)
+        br = _word_break_proto(w)
+        if br in (_BREAK_SPACE, _BREAK_SURE_SPACE):
+            if not buf[-1].endswith(" "):
+                buf.append(" ")
+        elif br in (_BREAK_EOL_SURE, _BREAK_LINE_BREAK):
+            line = "".join(buf).rstrip()
+            if line:
+                lines.append(line)
+            buf = []
+    tail = "".join(buf).strip()
+    if tail:
+        lines.append(tail)
+    return lines
+
+def _pages_to_map_proto(pages) -> Tuple[str, int, Dict[int, List[str]]]:
+    per_page: Dict[int, List[str]] = {}
+    all_lines: List[str] = []
+    for idx, page in enumerate(pages, start=1):
+        lines: List[str] = []
+        for block in page.blocks:
+            for para in block.paragraphs:
+                lines.extend(_paragraph_lines_proto(para))
+        per_page[idx] = lines
+        all_lines.extend(lines)
+    joined = "\n".join(all_lines)
+    return joined, len(per_page), per_page
+
+def _gcs_upload(storage_client: storage.Client, bucket: str, key: str, data: bytes, content_type: str):
+    b = storage_client.bucket(bucket)
+    b.storage_class  # touch to surface permission errors early
+    blob = b.blob(key)
+    blob.content_type = content_type
+    blob.upload_from_string(data, content_type=content_type)
+
+def _gcs_list_prefix(storage_client: storage.Client, bucket: str, prefix: str):
+    return list(storage_client.list_blobs(bucket, prefix=prefix))
+
+def _gcs_download_text(storage_client: storage.Client, bucket: str, blob_name: str) -> str:
+    b = storage_client.bucket(bucket)
+    return b.blob(blob_name).download_as_text()
+
+def _vision_pdf_async(client: vision.ImageAnnotatorClient,
+                      storage_client: storage.Client,
+                      bucket: str,
+                      gcs_input_uri: str,
+                      gcs_output_prefix: str,
+                      timeout: int = 60*30):
+    feature = Feature(type_=Feature.Type.DOCUMENT_TEXT_DETECTION)
+    input_cfg = InputConfig(gcs_source=GcsSource(uri=gcs_input_uri), mime_type="application/pdf")
+    output_cfg = OutputConfig(gcs_destination=GcsDestination(uri=gcs_output_prefix), batch_size=25)
+    request = AsyncAnnotateFileRequest(features=[feature], input_config=input_cfg, output_config=output_cfg)
+    op: Operation = client.async_batch_annotate_files(requests=[request])
+    op.result(timeout=timeout)  # wait for completion
+
+    out_bucket = gcs_output_prefix.split("gs://", 1)[1].split("/", 1)[0]
+    out_prefix = gcs_output_prefix.split(out_bucket, 1)[1].lstrip("/")
+    blobs = _gcs_list_prefix(storage_client, out_bucket, out_prefix)
+    blobs = [b for b in blobs if b.name.endswith(".json")]
+    blobs.sort(key=lambda b: b.name)
+
+    # Helpers for JSON (dict) structure
+    def _word_text_dict(w: dict) -> str:
+        return "".join(s.get("text", "") for s in (w.get("symbols") or []))
+
+    def _word_break_dict(w: dict):
+        syms = w.get("symbols") or []
+        if not syms:
+            return None
+        last = syms[-1]
+        prop = last.get("property") or {}
+        return (prop.get("detectedBreak") or {}).get("type")
+
+    per_page: Dict[int, List[str]] = {}
+    all_lines: List[str] = []
+    page_idx = 0
+
+    for blob in blobs:
+        data = json.loads(_gcs_download_text(storage_client, out_bucket, blob.name))
+        for r in data.get("responses", []):
+            ann = r.get("fullTextAnnotation") or {}
+            pages = ann.get("pages") or []
+            for p in pages:
+                page_idx += 1
+                lines: List[str] = []
+                buf: List[str] = []
+                for block in p.get("blocks", []):
+                    for para in block.get("paragraphs", []):
+                        for w in para.get("words", []):
+                            wtxt = _word_text_dict(w)
+                            if not wtxt:
+                                continue
+                            if buf and not buf[-1].endswith(" "):
+                                buf.append(" ")
+                            buf.append(wtxt)
+                            br = _word_break_dict(w)
+                            if br in (_BREAK_SPACE, _BREAK_SURE_SPACE):
+                                if not buf[-1].endswith(" "):
+                                    buf.append(" ")
+                            elif br in (_BREAK_EOL_SURE, _BREAK_LINE_BREAK):
+                                line = "".join(buf).rstrip()
+                                if line:
+                                    lines.append(line)
+                                buf = []
+                        if buf:
+                            line = "".join(buf).rstrip()
+                            if line:
+                                lines.append(line)
+                            buf = []
+                per_page[page_idx] = lines
+                all_lines.extend(lines)
+
+    joined = "\n".join(all_lines)
+    page_count = page_idx or 1
+    return joined, page_count, per_page
 
 # =========================
-# STAGE 1: OCR (returns page texts)
+# STAGE 1: OCR (Vision-first)
 # =========================
 def ocr_pdf_pages(blob: bytes, lang: str) -> List[Tuple[int, str]]:
     """
-    For each page:
-      1) Try selectable text via PyMuPDF.
-      2) If empty, render low-memory grayscale JPEG and OCR via vision model (per page).
-    Returns: [(page_number, text), ...]
+    Default: Google Cloud Vision (async PDF) via GCS (per google_vision.py).
+    Returns per-page text list [(page_number, text), ...].
     """
+    if not VISION_CLIENT or not STORAGE_CLIENT:
+        raise HTTPException(status_code=503, detail="Google Vision not initialized (check GOOGLE_APPLICATION_CREDENTIALS).")
+    if not GCV_BUCKET:
+        raise HTTPException(status_code=503, detail="GCV_BUCKET env is required for PDF OCR.")
+
     translate = (lang or "en").lower() == "hi"
+    key = f"{GCV_PREFIX}{uuid.uuid4().hex}.pdf"
+    _gcs_upload(STORAGE_CLIENT, GCV_BUCKET, key, blob, "application/pdf")
+    gcs_in = f"gs://{GCV_BUCKET}/{key}"
+    out_prefix = f"gs://{GCV_BUCKET}/{GCV_PREFIX}vision_out/{uuid.uuid4().hex}/"
+
+    log(logging.INFO, "GCV PDF OCR: start", input=gcs_in, out_prefix=out_prefix)
+    joined, page_count, per_page_map = _vision_pdf_async(
+        VISION_CLIENT, STORAGE_CLIENT, GCV_BUCKET, gcs_in, out_prefix, timeout=60*30
+    )
+    log(logging.INFO, "GCV PDF OCR: done", pages=page_count, chars=len(joined))
+
     results: List[Tuple[int, str]] = []
-    max_side_px = 1400
-    jpeg_quality = 52
-
-    with fitz.open(stream=blob, filetype="pdf") as doc:
-        log(logging.INFO, "PDF opened", pages=doc.page_count, translate=translate, max_side_px=max_side_px, jpeg_quality=jpeg_quality)
-        for i, page in enumerate(doc, start=1):
-            t_page0 = time.time()
-            text = (page.get_text("text") or "").strip()
-            if text:
-                log(logging.DEBUG, "PDF page selectable text", page=i, text_len=len(text))
-            if not text:
-                w_pt, h_pt = float(page.rect.width), float(page.rect.height)
-                cap_scale = max_side_px / max(w_pt, h_pt) if max(w_pt, h_pt) > 0 else 1.0
-                scale = max(1.0, min(2.0, cap_scale))
-                log(logging.DEBUG, "PDF page render->OCR", page=i, width_pt=w_pt, height_pt=h_pt, scale=round(scale,3))
-                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), colorspace=fitz.csGRAY, alpha=False)
-                img = Image.frombytes("L", [pix.width, pix.height], pix.samples)
-                img.thumbnail((max_side_px, max_side_px))
-                data_url = img_to_jpeg_data_url(img, quality=jpeg_quality)
-                img.close(); del pix
-
-                messages = [
-                    {"role": "system", "content": [{"type": "input_text", "text":
-                        "You perform OCR on a single scanned page. Return only the plain text. Keep original line breaks. No commentary."}]},
-                    {"role": "user", "content": [
-                        {"type": "input_image", "image_url": data_url, "detail": "high"},
-                    ]},
-                ]
-                log(logging.INFO, "OCR page via OpenAI Vision:start", page=i, model=MODEL)
-                text = call_responses(messages, model=MODEL).strip()
-                log(logging.INFO, "OCR page via OpenAI Vision:done", page=i, model=MODEL, text_len=len(text))
-
-            text = text_maybe_translate(text, translate)
-            if translate:
-                log(logging.DEBUG, "Page translated (if needed)", page=i, final_len=len(text))
-            results.append((i, text))
-            log(logging.DEBUG, "Page done", page=i, ms=int((time.time()-t_page0)*1000))
-
+    for pno in range(1, page_count + 1):
+        txt = "\n".join(per_page_map.get(pno, []))
+        txt = text_maybe_translate(txt, translate)
+        results.append((pno, txt))
     return results
 
 def ocr_image_pages(filename: str, blob: bytes, lang: str) -> List[Tuple[int, str]]:
+    """
+    Default: Google Cloud Vision document_text_detection for single image.
+    """
+    if not VISION_CLIENT:
+        raise HTTPException(status_code=503, detail="Google Vision not initialized (check GOOGLE_APPLICATION_CREDENTIALS).")
+
     translate = (lang or "en").lower() == "hi"
-    mime, _ = mimetypes.guess_type(filename)
-    if not mime or not mime.startswith("image/"):
-        mime = "image/jpeg"
-    data_url = "data:%s;base64,%s" % (mime, base64.b64encode(blob).decode("utf-8"))
-    log(logging.INFO, "Image OCR via OpenAI Vision:start", filename=filename, mime=mime, model=MODEL, bytes=len(blob))
-    messages = [
-        {"role": "system", "content": [{"type": "input_text", "text":
-            "You perform OCR on a single image. Return only the plain text. Keep original line breaks. No commentary."}]},
-        {"role": "user", "content": [{"type": "input_image", "image_url": data_url, "detail": "high"}]},
-    ]
-    text = call_responses(messages, model=MODEL).strip()
-    log(logging.INFO, "Image OCR via OpenAI Vision:done", filename=filename, text_len=len(text))
-    text = text_maybe_translate(text, translate)
-    if translate:
-        log(logging.DEBUG, "Image text translated (if needed)", filename=filename, final_len=len(text))
-    return [(1, text)]
+    image = vision.Image(content=blob)
+    log(logging.INFO, "GCV Image OCR: start", filename=filename, bytes=len(blob))
+    resp = VISION_CLIENT.document_text_detection(
+        image=image, image_context={"language_hints": ["hi", "en"]}
+    )
+    if resp.error.message:
+        raise HTTPException(status_code=502, detail=f"Vision error: {resp.error.message}")
+
+    ann = resp.full_text_annotation
+    if not ann or not ann.pages:
+        pages = [(1, "")]
+    else:
+        _, page_count, per_page_map = _pages_to_map_proto(ann.pages)
+        pages = [(pno, "\n".join(per_page_map.get(pno, []))) for pno in range(1, page_count + 1)]
+
+    pages = [(pno, text_maybe_translate(txt, translate)) for (pno, txt) in pages]
+    log(logging.INFO, "GCV Image OCR: done", pages=len(pages))
+    return pages
 
 def ocr_docx_pages(blob: bytes, lang: str) -> List[Tuple[int, str]]:
     translate = (lang or "en").lower() == "hi"
@@ -302,28 +453,29 @@ def ocr_docx_pages(blob: bytes, lang: str) -> List[Tuple[int, str]]:
     text = "\n".join(parts).strip()
     log(logging.INFO, "DOCX parse:done", chars=len(text))
     text = text_maybe_translate(text, translate)
-    if translate:
-        log(logging.DEBUG, "DOCX text translated (if needed)", final_len=len(text))
     return [(1, text)]
 
 def ocr_pages(filename: str, blob: bytes, lang: str) -> List[Tuple[int, str]]:
+    """
+    Vision-first dispatch. DOCX stays local. OpenAI is NOT used for OCR anymore.
+    """
     ext = Path(filename).suffix.lower()
     if ext == ".pdf" or blob[:5] == b"%PDF-":
-        log(logging.INFO, "OCR stage: PDF detected")
+        log(logging.INFO, "OCR stage: PDF detected (Google Vision)")
         return ocr_pdf_pages(blob, lang)
     if ext == ".docx" or mimetypes.guess_type(filename)[0] == \
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-        log(logging.INFO, "OCR stage: DOCX detected")
+        log(logging.INFO, "OCR stage: DOCX detected (local text extraction)")
         return ocr_docx_pages(blob, lang)
     mime, _ = mimetypes.guess_type(filename)
     if mime and mime.startswith("image/"):
-        log(logging.INFO, "OCR stage: IMAGE detected", mime=mime)
+        log(logging.INFO, "OCR stage: IMAGE detected (Google Vision)", mime=mime)
         return ocr_image_pages(filename, blob, lang)
-    log(logging.INFO, "OCR stage: defaulting to IMAGE path", mime=mime)
+    log(logging.INFO, "OCR stage: defaulting to IMAGE path (Google Vision)")
     return ocr_image_pages(filename, blob, lang)
 
 # =========================
-# STAGE 2: INTERPRETATION (text-only)
+# STAGE 2: INTERPRETATION (text-only, unchanged)
 # =========================
 DOC_INSTR_BASE = (
     "You are an information extraction engine. Use ONLY the provided page texts. "
@@ -439,10 +591,10 @@ def parse_file(filename: str, blob: bytes, lang: str, fields: List[str]) -> Dict
     t0 = time.time()
     ftype = detect_type(filename, blob)
     log(logging.INFO, "Parse file:start", filename=filename, size=len(blob), type=ftype, lang=lang, fields=len(fields))
-    # 1) OCR pages → texts
+    # 1) OCR pages → texts (NOW Vision-first)
     pages = ocr_pages(filename, blob, lang)
     log(logging.INFO, "Parse file:OCR done", filename=filename, pages=len(pages), ms=int((time.time()-t0)*1000))
-    # 2) Interpretation on text only
+    # 2) Interpretation on text only (unchanged)
     t1 = time.time()
     result = interpret_text_structured(filename, pages, fields)
     log(logging.INFO, "Parse file:Interpretation done", filename=filename, ms=int((time.time()-t1)*1000))
@@ -524,7 +676,11 @@ async def parse(
 @app.get("/health")
 def health():
     ok = bool(SECRET_API_KEY)
-    log(logging.DEBUG, "Health check", ok=ok)
-    if not ok:
-        return {"ok": False, "error": "SECRET_API_KEY not set", "ocr_model": MODEL, "text_model": TEXT_MODEL}
-    return {"ok": True, "ocr_model": MODEL, "text_model": TEXT_MODEL}
+    gcv_ok = bool(VISION_CLIENT) and bool(STORAGE_CLIENT)
+    return {
+        "ok": ok and gcv_ok,
+        "auth": bool(SECRET_API_KEY),
+        "gcv_clients": gcv_ok,
+        "gcv_bucket": bool(GCV_BUCKET),
+        "text_model": TEXT_MODEL,
+    }
