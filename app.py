@@ -212,25 +212,14 @@ def call_responses(messages: list, *, model: str) -> str:
         log(logging.ERROR, "OpenAI call:error", model=model, ms=int((time.time()-t0)*1000), error=str(e))
         raise
 
+# === Replace the entire translate_to_english() and text_maybe_translate() ===
 def translate_to_english(text: str) -> str:
-    if not text.strip():
-        return text
-    messages = [
-        {"role": "system", "content": [{"type": "input_text", "text":
-            "You are a professional translator. Translate to natural, fluent English. Preserve line breaks; no commentary."}]},
-        {"role": "user", "content": [{"type": "input_text", "text": text}]},
-    ]
-    log(logging.INFO, "Translate:start", model=TEXT_MODEL, detected_script="devanagari")
-    out = call_responses(messages, model=TEXT_MODEL)
-    if not out or out.lower().startswith(("sorry", "i can't", "i cannot", "i am sorry")):
-        log(logging.WARNING, "Translate:fallback_to_vision_model", fallback_model=MODEL)
-        out = call_responses(messages, model=MODEL)  # fallback
-    log(logging.INFO, "Translate:done", out_len=len(out))
-    return out.strip()
+    # Kept for compatibility, but unused in OCR stage now
+    return text
 
 def text_maybe_translate(text: str, translate: bool) -> str:
-    if translate and DEVANAGARI_RE.search(text or ""):
-        return translate_to_english(text)
+    # Do not translate during OCR; translation will be handled in the single
+    # interpretation call to keep it to exactly one OpenAI request per file.
     return text
 
 # =========================
@@ -383,8 +372,10 @@ def _vision_pdf_async(client: vision.ImageAnnotatorClient,
 # =========================
 def ocr_pdf_pages(blob: bytes, lang: str) -> List[Tuple[int, str]]:
     """
-    Default: Google Cloud Vision (async PDF) via GCS (per google_vision.py).
-    Returns per-page text list [(page_number, text), ...].
+    Upload the entire PDF to Google Cloud Vision (async batch via GCS),
+    then return page-labeled texts so the interpreter can preserve sources.
+
+    Returns: [(page_number, text), ...]
     """
     if not VISION_CLIENT or not STORAGE_CLIENT:
         raise HTTPException(status_code=503, detail="Google Vision not initialized (check GOOGLE_APPLICATION_CREDENTIALS).")
@@ -392,22 +383,29 @@ def ocr_pdf_pages(blob: bytes, lang: str) -> List[Tuple[int, str]]:
         raise HTTPException(status_code=503, detail="GCV_BUCKET env is required for PDF OCR.")
 
     translate = (lang or "en").lower() == "hi"
+
+    # 1) Upload once
     key = f"{GCV_PREFIX}{uuid.uuid4().hex}.pdf"
     _gcs_upload(STORAGE_CLIENT, GCV_BUCKET, key, blob, "application/pdf")
     gcs_in = f"gs://{GCV_BUCKET}/{key}"
+
+    # 2) Async output prefix
     out_prefix = f"gs://{GCV_BUCKET}/{GCV_PREFIX}vision_out/{uuid.uuid4().hex}/"
 
-    log(logging.INFO, "GCV PDF OCR: start", input=gcs_in, out_prefix=out_prefix)
+    log(logging.INFO, "GCV PDF OCR: start (multi-page labeled)", input=gcs_in, out_prefix=out_prefix)
     joined, page_count, per_page_map = _vision_pdf_async(
         VISION_CLIENT, STORAGE_CLIENT, GCV_BUCKET, gcs_in, out_prefix, timeout=60*30
     )
-    log(logging.INFO, "GCV PDF OCR: done", pages=page_count, chars=len(joined))
+    log(logging.INFO, "GCV PDF OCR: done", pages=page_count, total_chars=len(joined))
 
+    # 3) Build page-labeled results (preserves page numbers)
     results: List[Tuple[int, str]] = []
-    for pno in range(1, page_count + 1):
-        txt = "\n".join(per_page_map.get(pno, []))
-        txt = text_maybe_translate(txt, translate)
+    # Ensure sequential labeling even if a JSON shard misses an empty page
+    for pno in range(1, max(1, page_count) + 1):
+        raw = "\n".join(per_page_map.get(pno, []))
+        txt = text_maybe_translate(raw, translate)
         results.append((pno, txt))
+
     return results
 
 def ocr_image_pages(filename: str, blob: bytes, lang: str) -> List[Tuple[int, str]]:
@@ -479,6 +477,7 @@ def ocr_pages(filename: str, blob: bytes, lang: str) -> List[Tuple[int, str]]:
 # =========================
 DOC_INSTR_BASE = (
     "You are an information extraction engine. Use ONLY the provided page texts. "
+    "If any text is in Hindi, translate to natural English in the output 'value'. "
     "For each requested field, return an object with keys: value (string), conf (0-1), "
     "and source (format 'FILENAME#page N'). Omit fields not confidently present. Do not fabricate."
 )
