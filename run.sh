@@ -1,1 +1,10 @@
-docker run -d -p 80:8080 --memory="3200m" --restart on-failure -e OPENAI_API_KEY=$OPENAI_API_KEY -e MAX_WORKERS=4 -e TIMEOUT=600 -e MODEL="gpt-5" -e SECRET_API_KEY=$SECRET_API_KEY ghcr.io/darkstar1997/ocr-engine
+docker run -d -p 80:8080 --memory="600m" --restart on-failure \
+  -v "$HOME/.config/gcloud/application_default_credentials.json:/app/adc.json:ro" \
+  -e TIMEOUT=600 \
+  -e GOOGLE_APPLICATION_CREDENTIALS=/app/adc.json \
+  -e GOOGLE_CLOUD_PROJECT=project-b0e0c2c6-984d-4ad9-b61  \
+  -e GCV_BUCKET=ocr-storage-gcv \
+  -e GCV_PREFIX=uploads \
+  -e SECRET_API_KEY=$SECRET_API_KEY \
+  -e OPENAI_API_KEY=$OPENAI_API_KEY \
+  ghcr.io/darkstar1997/ocr-engine
