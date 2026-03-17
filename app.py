@@ -1,4 +1,3 @@
-# app.py
 import io
 import os
 import re
@@ -10,7 +9,7 @@ import mimetypes
 import uuid
 import contextvars
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Annotated
 
 import fitz  # PyMuPDF
 from PIL import Image
@@ -88,20 +87,65 @@ CLIENT = OpenAI(timeout=600.0, max_retries=5)
 log(logging.INFO, "Server startup", openai_timeout=600, openai_retries=5, text_model=TEXT_MODEL)
 
 # Google Vision defaults
-GCV_BUCKET = os.getenv("GCV_BUCKET", "ocr-storage-db").strip()
+GCV_BUCKET = os.getenv("GCV_BUCKET", "ocr-storage-gcv").strip()
 GCV_PREFIX = os.getenv("GCV_PREFIX", "uploads/").strip().strip("/")  # e.g. "uploads"
 if GCV_PREFIX:
     GCV_PREFIX = GCV_PREFIX + "/"
 
-# Init Vision + Storage clients (will raise if credentials missing)
+GOOGLE_CLOUD_PROJECT = (
+    os.getenv("GOOGLE_CLOUD_PROJECT")
+    or os.getenv("GOOGLE_PROJECT_ID")
+    or os.getenv("GCLOUD_PROJECT")
+    or ""
+).strip()
+
+
+def _detect_adc_source() -> str:
+    cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if cred_path:
+        return f"file:{cred_path}"
+    try:
+        adc_path = Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
+        if adc_path.exists():
+            return f"default-user-adc:{adc_path}"
+    except Exception:
+        pass
+    return "ambient"
+
+
+# Init Vision + Storage clients using ADC.
+# Works with:
+# 1) GOOGLE_APPLICATION_CREDENTIALS pointing to an ADC or external-account file
+# 2) gcloud application-default login credentials mounted into the container
+# 3) ambient credentials when running on supported Google Cloud runtimes
 try:
+    ADC_SOURCE = _detect_adc_source()
+    if not GOOGLE_CLOUD_PROJECT:
+        raise RuntimeError(
+            "Project was not passed and could not be determined from the environment. "
+            "Set GOOGLE_CLOUD_PROJECT explicitly when using ADC in Docker."
+        )
     VISION_CLIENT = vision.ImageAnnotatorClient()
-    STORAGE_CLIENT = storage.Client()
-    log(logging.INFO, "Google clients initialized", gcv_bucket=GCV_BUCKET, gcv_prefix=GCV_PREFIX or "(none)")
+    STORAGE_CLIENT = storage.Client(project=GOOGLE_CLOUD_PROJECT)
+    log(
+        logging.INFO,
+        "Google clients initialized via ADC",
+        adc_source=ADC_SOURCE,
+        google_cloud_project=GOOGLE_CLOUD_PROJECT,
+        gcv_bucket=GCV_BUCKET,
+        gcv_prefix=GCV_PREFIX or "(none)",
+    )
 except Exception as e:
+    ADC_SOURCE = _detect_adc_source()
     VISION_CLIENT = None
     STORAGE_CLIENT = None
-    log(logging.ERROR, "Google clients init failed", error=str(e))
+    log(
+        logging.ERROR,
+        "Google clients init failed",
+        adc_source=ADC_SOURCE,
+        google_cloud_project=GOOGLE_CLOUD_PROJECT or "(missing)",
+        error=str(e),
+    )
 
 # =========================
 # Auth (SECRET_API_KEY)
@@ -378,7 +422,14 @@ def ocr_pdf_pages(blob: bytes, lang: str) -> List[Tuple[int, str]]:
     Returns: [(page_number, text), ...]
     """
     if not VISION_CLIENT or not STORAGE_CLIENT:
-        raise HTTPException(status_code=503, detail="Google Vision not initialized (check GOOGLE_APPLICATION_CREDENTIALS).")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Google Vision not initialized via ADC. "
+                "Run 'gcloud auth application-default login' on the host and mount the ADC file into the container, "
+                "or set GOOGLE_APPLICATION_CREDENTIALS to an ADC/external-account credential file."
+            ),
+        )
     if not GCV_BUCKET:
         raise HTTPException(status_code=503, detail="GCV_BUCKET env is required for PDF OCR.")
 
@@ -413,7 +464,14 @@ def ocr_image_pages(filename: str, blob: bytes, lang: str) -> List[Tuple[int, st
     Default: Google Cloud Vision document_text_detection for single image.
     """
     if not VISION_CLIENT:
-        raise HTTPException(status_code=503, detail="Google Vision not initialized (check GOOGLE_APPLICATION_CREDENTIALS).")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Google Vision not initialized via ADC. "
+                "Run 'gcloud auth application-default login' on the host and mount the ADC file into the container, "
+                "or set GOOGLE_APPLICATION_CREDENTIALS to an ADC/external-account credential file."
+            ),
+        )
 
     translate = (lang or "en").lower() == "hi"
     image = vision.Image(content=blob)
@@ -605,12 +663,18 @@ def parse_file(filename: str, blob: bytes, lang: str, fields: List[str]) -> Dict
 @app.post("/parse", response_class=PlainTextResponse)
 async def parse(
     request: Request,
-    files: List[UploadFile] = File(..., description="List of files (PDF/PNG/JPG/WEBP/DOCX)"),
-    langs: List[str] = Form(..., description="List of language tags (en/hi) in the same order as files"),
-    fields_to_extract: List[str] = Form(
-        ...,
-        description="Mandatory: field labels to extract (repeat this field OR provide a comma/newline/semicolon-separated list)",
-    ),
+    files: Annotated[
+        List[UploadFile],
+        File(description="List of files (PDF/PNG/JPG/WEBP/DOCX)")
+    ],
+    langs: Annotated[
+        List[str],
+        Form(description="List of language tags (en/hi) in the same order as files")
+    ],
+    fields_to_extract: Annotated[
+        List[str],
+        Form(description="Mandatory: field labels to extract (repeat this field OR provide a comma/newline/semicolon-separated list)")
+    ],
     _auth_ok: bool = Depends(require_api_key),
 ) -> PlainTextResponse:
     # Correlate logs for this request
@@ -681,5 +745,6 @@ def health():
         "auth": bool(SECRET_API_KEY),
         "gcv_clients": gcv_ok,
         "gcv_bucket": bool(GCV_BUCKET),
+        "adc_source": ADC_SOURCE,
         "text_model": TEXT_MODEL,
     }
