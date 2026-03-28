@@ -333,6 +333,15 @@ def _gcs_upload(storage_client: storage.Client, bucket: str, key: str, data: byt
 def _gcs_list_prefix(storage_client: storage.Client, bucket: str, prefix: str):
     return list(storage_client.list_blobs(bucket, prefix=prefix))
 
+def _gcs_cleanup(storage_client: storage.Client, bucket: str, keys: List[str]):
+    """Deletion of GCS objects."""
+    b = storage_client.bucket(bucket)
+    for key in keys:
+        try:
+            b.blob(key).delete()
+        except Exception as e:
+            log(logging.WARNING, "GCS cleanup: failed to delete", key=key, error=str(e))
+
 def _gcs_download_text(storage_client: storage.Client, bucket: str, blob_name: str) -> str:
     b = storage_client.bucket(bucket)
     return b.blob(blob_name).download_as_text()
@@ -441,13 +450,22 @@ def ocr_pdf_pages(blob: bytes, lang: str) -> List[Tuple[int, str]]:
     gcs_in = f"gs://{GCV_BUCKET}/{key}"
 
     # 2) Async output prefix
-    out_prefix = f"gs://{GCV_BUCKET}/{GCV_PREFIX}vision_out/{uuid.uuid4().hex}/"
+    out_uuid = uuid.uuid4().hex
+    out_prefix = f"gs://{GCV_BUCKET}/{GCV_PREFIX}vision_out/{out_uuid}/"
 
     log(logging.INFO, "GCV PDF OCR: start (multi-page labeled)", input=gcs_in, out_prefix=out_prefix)
-    joined, page_count, per_page_map = _vision_pdf_async(
-        VISION_CLIENT, STORAGE_CLIENT, GCV_BUCKET, gcs_in, out_prefix, timeout=60*30
-    )
-    log(logging.INFO, "GCV PDF OCR: done", pages=page_count, total_chars=len(joined))
+    try:
+        joined, page_count, per_page_map = _vision_pdf_async(
+            VISION_CLIENT, STORAGE_CLIENT, GCV_BUCKET, gcs_in, out_prefix, timeout=60*30
+        )
+        log(logging.INFO, "GCV PDF OCR: done", pages=page_count, total_chars=len(joined))
+    finally:
+        # Clean up: input PDF + all output JSON blobs
+        out_blob_prefix = f"{GCV_PREFIX}vision_out/{out_uuid}/"
+        out_blobs = _gcs_list_prefix(STORAGE_CLIENT, GCV_BUCKET, out_blob_prefix)
+        keys_to_delete = [key] + [b.name for b in out_blobs]
+        log(logging.INFO, "GCS cleanup: deleting temp objects", count=len(keys_to_delete))
+        _gcs_cleanup(STORAGE_CLIENT, GCV_BUCKET, keys_to_delete)
 
     # 3) Build page-labeled results (preserves page numbers)
     results: List[Tuple[int, str]] = []
